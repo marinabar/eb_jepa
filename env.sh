@@ -24,6 +24,10 @@ export PATH="$UV_INSTALL_DIR:$HOME/.local/bin:$PATH"
 # uv cache and venv (arch-specific so x86_64 and aarch64 don't collide)
 export UV_CACHE_DIR=$WORK/uv_cache/$ARCH
 export UV_PROJECT_ENVIRONMENT=$WORK/venvs/eb_jepa_$ARCH
+# uv-managed CPython must also live on /work. Otherwise uv installs it under
+# ~/.local/share/uv/python, which overflows the small /lustre/home quota and makes the
+# aarch64 venv-sync job die with "Disk quota exceeded" during CPython extraction.
+export UV_PYTHON_INSTALL_DIR=$WORK/uv_python/$ARCH
 
 # Keep ALL caches on /work — the /lustre/home quota is small and fills up fast
 # (model/dataset downloads, torch.compile kernels, pip wheels, matplotlib, ...).

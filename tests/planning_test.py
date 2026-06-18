@@ -231,6 +231,9 @@ def test_main_eval(mock_gc_agent):
     mock_env.eval_state = Mock(return_value={"success": False, "state_dist": 5.0})
     mock_env.n_steps = 10
     mock_env.n_allowed_steps = 10
+    # Numeric so `waypoint_reach_cells * env.cell_size` in planning.main_eval works
+    # (otherwise env.cell_size is a Mock -> "unsupported operand for *: float and Mock").
+    mock_env.cell_size = 1.0
     mock_env.action_space = gym.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
     mock_env.normalizer = Mock()
 

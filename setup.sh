@@ -98,6 +98,10 @@ if [[ "$ARCH" == "x86_64" ]]; then
         --parsable \
         --wrap="set -e
 source $REPO_ROOT/env.sh
+# Reuse the cluster's Python module so uv does NOT download a managed CPython into the
+# small /lustre/home quota (matches slurm_test.sh). UV_PYTHON_INSTALL_DIR (set in env.sh)
+# is the belt-and-suspenders fallback if no module is available.
+module load python312 2>/dev/null || true
 if ! \$UV_INSTALL_DIR/uv --version &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=\$UV_INSTALL_DIR sh
 fi
