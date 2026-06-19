@@ -39,6 +39,8 @@ dependencies = [
     "omegaconf",
     "pyyaml",
     "ruamel.yaml",
+    "pyarrow",
+    "pandas",
 ]
 requires-python = "==3.12.*"
 
