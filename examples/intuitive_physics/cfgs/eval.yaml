@@ -1,0 +1,22 @@
+# Intuitive physics — probe config (matched plausible/impossible held-out pairs).
+meta:
+  seed: 1
+  device: auto
+
+data:
+  T: 10                # must match the trained model
+
+model:                 # must match the trained checkpoint's architecture
+  dobs: 1
+  henc: 32
+  dstc: 16
+  hpre: 32
+  steps: 4             # K rollout steps used by the probe
+
+loss:                  # only needed so build_jepa can construct the model; unused by the probe
+  std_coeff: 10.0
+  cov_coeff: 100.0
+
+probe:
+  n_pairs: 200         # matched pairs per violation type
+  seed: 999            # held-out from training

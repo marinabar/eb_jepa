@@ -1,0 +1,30 @@
+# Intuitive physics — video-JEPA training on procedural bouncing MNIST.
+meta:
+  seed: 1
+  device: auto         # auto | cuda | cpu
+  model_folder:        # optional explicit run dir; else auto under $EBJEPA_CKPTS
+
+data:
+  T: 10                # frames per clip
+  n_train: 9000        # procedural plausible clips per epoch
+  batch_size: 64
+  num_workers: 8
+
+model:
+  dobs: 1              # input channels (grayscale)
+  henc: 32             # encoder hidden dim
+  dstc: 16             # latent representation dim
+  hpre: 32             # predictor hidden dim
+  steps: 4             # K parallel rollout steps
+
+loss:
+  std_coeff: 10.0      # VICReg variance (anti-collapse) weight
+  cov_coeff: 100.0     # VICReg covariance (decorrelation) weight
+
+optim:
+  lr: 1.0e-3
+  epochs: 50
+
+logging:
+  log_wandb: false     # set true to log train metrics to wandb
+  tqdm_silent: true

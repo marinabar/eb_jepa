@@ -1550,9 +1550,21 @@ MNIST sequences (a digit teleporting, passing through a wall, or reversing
 instantly) and ask whether prediction energy in latent space spikes on the
 impossible ones, a violation-of-expectation signal. \textbf{Files:} a probe that
 constructs paired plausible/impossible clips and compares \code{predcost} energy;
-light additions to the video eval. \textbf{Metric:} the energy gap (impossible $>$
-plausible) and how it grows over training. Exploratory, cheap, and genuinely
-open at this scale.
+light additions to the video eval (\code{examples/intuitive\_physics}).
+\textbf{Metric:} the energy gap (impossible $>$ plausible) and how it grows over
+training. Exploratory, cheap, and genuinely open at this scale.
+
+\textbf{poc:} on procedural bouncing-MNIST, a video-JEPA's \code{predcost} energy
+detects physically impossible clips at \textbf{AUROC $\approx$1.0} (vs 0.5 at init),
+but controls show this is largely \emph{out-of-distribution motion}: a one-line
+max-displacement baseline matches it on teleport / wall-passthrough, and it flags
+\emph{physically legal} fast clips at \textbf{1.0}. The genuine, magnitude-matched
+signal is an instant \emph{velocity reversal} (\textbf{0.999} vs \textbf{0.47}
+trivial) and \emph{freeze} (0.99 vs 0.45), which require the latent-prediction
+objective (a generative pixel model's own latent reaches only \textbf{0.5--0.8})
+and anti-collapse regularization (none $\rightarrow$ rank-1 collapse $\rightarrow$
+0.5). Answer to the open question: a sensitive OOD-motion detector with a real but
+narrow learned-dynamics core, not general physics understanding.
 \end{trackbox}
 
 \begin{tipbox}
