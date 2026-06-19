@@ -229,3 +229,6 @@ eb_jepa_ICLR/
 arxiv/
 arxiv_tmp/
 setup.md
+
+# Synthetic viz demo outputs (regenerate via eb_jepa.singlecell.viz_demo)
+viz_out/
