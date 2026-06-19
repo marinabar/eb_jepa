@@ -123,6 +123,48 @@ class TestEncoder:
             SingleCellEncoder(embed, d_model=D_MODEL, use_cls=False, readout="cls")
 
 
+class TestFromCache:
+    def test_from_cache_noncontiguous_token_ids(self, tmp_path):
+        # Real Tahoe token_ids are non-contiguous (0-2 reserved, genes up to 62712).
+        # from_cache must size tables by max(token_id)+1 and index by token_id.
+        import json
+
+        import numpy as np
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        d_esmc, d_evo2 = 8, 6
+        token_ids = [3, 5, 9]  # max 9 -> tables must have 10 rows
+        is_coding = [True, False, True]
+        esmc_row = [0, -1, 1]
+        evo2_row = [0, 1, 2]
+        np.save(tmp_path / "esmc.npy", np.random.randn(2, d_esmc).astype("float32"))
+        np.save(tmp_path / "evo2.npy", np.random.randn(3, d_evo2).astype("float32"))
+        pq.write_table(
+            pa.table(
+                {
+                    "token_id": token_ids,
+                    "is_coding": is_coding,
+                    "esmc_row": esmc_row,
+                    "evo2_row": evo2_row,
+                    "ensembl_id": ["ENSG1", "ENSG2", "ENSG3"],
+                }
+            ),
+            str(tmp_path / "index.parquet"),
+        )
+        (tmp_path / "metadata.json").write_text(json.dumps({"d_evo2": d_evo2}))
+
+        embed = GeneTokenEmbedding.from_cache(tmp_path, d_model=16)
+        assert embed.n_genes == 10  # max token id (9) + 1
+        # indexing by the real (non-contiguous) token ids must not go out of bounds
+        ids = torch.tensor([[3, 5, 9]])
+        out = embed(ids, count_value=torch.zeros(1, 3))
+        assert out.shape == (1, 3, 16) and torch.isfinite(out).all()
+        # non-coding token (5) has a zero protein term
+        assert embed.coding_mask[5].item() is False
+        assert embed.coding_mask[3].item() is True
+
+
 class TestLeJEPAIntegration:
     def test_tiny_overfit_decreases_loss(self):
         torch.manual_seed(0)

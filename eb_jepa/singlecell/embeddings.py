@@ -123,14 +123,18 @@ class GeneTokenEmbedding(nn.Module):
         index = pq.read_table(cache_dir / "index.parquet").to_pydict()
         esmc_raw = np.load(cache_dir / "esmc.npy")  # [N_coding, d_esmc]
         evo2_raw = np.load(cache_dir / "evo2.npy")  # [N_genes, d_evo2]
-        n_genes = len(index["token_id"])
+        token_ids = index["token_id"]
         d_esmc, d_evo2 = esmc_raw.shape[1], evo2_raw.shape[1]
+        # token_ids are NOT contiguous and do not start at 0 (0-2 are reserved
+        # special tokens; gene ids run up to ~62712). Size the lookup tables by the
+        # max token id so they can be indexed directly by token id.
+        vocab_size = int(max(token_ids)) + 1
 
-        esmc_table = torch.zeros(n_genes, d_esmc, dtype=torch.float32)
-        evo2_table = torch.zeros(n_genes, d_evo2, dtype=torch.float32)
-        coding_mask = torch.zeros(n_genes, dtype=torch.bool)
+        esmc_table = torch.zeros(vocab_size, d_esmc, dtype=torch.float32)
+        evo2_table = torch.zeros(vocab_size, d_evo2, dtype=torch.float32)
+        coding_mask = torch.zeros(vocab_size, dtype=torch.bool)
         for tok, is_coding, esmc_row, evo2_row in zip(
-            index["token_id"], index["is_coding"], index["esmc_row"], index["evo2_row"]
+            token_ids, index["is_coding"], index["esmc_row"], index["evo2_row"]
         ):
             evo2_table[tok] = torch.from_numpy(evo2_raw[evo2_row])
             if is_coding and esmc_row >= 0:
@@ -138,7 +142,7 @@ class GeneTokenEmbedding(nn.Module):
                 coding_mask[tok] = True
         assert d_evo2 == meta.get("d_evo2", d_evo2)
         return cls(
-            n_genes, d_model, esmc_table, evo2_table, coding_mask, count_mode, n_bins
+            vocab_size, d_model, esmc_table, evo2_table, coding_mask, count_mode, n_bins
         )
 
     @classmethod

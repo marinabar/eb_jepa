@@ -1048,10 +1048,7 @@ def merge_shards(cfg: Config, num_shards: Optional[int] = None) -> None:
     n_coding = sum(1 for r in shard_index_rows if r["is_coding"] and r["esmc_row"] >= 0)
 
     global_esmc = np.lib.format.open_memmap(
-        out / "esmc.npy",
-        mode="w+",
-        dtype=np.float32,
-        shape=(max(n_coding, 1), ESMC_DIM),
+        out / "esmc.npy", mode="w+", dtype=np.float32, shape=(max(n_coding, 1), ESMC_DIM)
     )
     global_evo2 = np.lib.format.open_memmap(
         out / "evo2.npy", mode="w+", dtype=np.float32, shape=(max(n_genes, 1), d_evo2)
