@@ -84,7 +84,7 @@ The architecture must be sized to the dataset and the GPU budget.
 
 ## Encoder architecture
 
-**Set-based transformer:** genes form an **unordered set**, so **no positional encoding / RoPE** on gene tokens; the **CLS** token (when enabled) is the only token with a dedicated identity. Choices are dictated by sequence length (~60k genes reduced to L per view), `torch.compile` (constant shapes), and the GB200 budget.
+**Set-based transformer:** genes form an **unordered set**, so **no positional encoding / RoPE** on gene tokens; the **CLS** token (when enabled) is the only token with a dedicated identity. Choices are dictated by sequence length (62,710 genes reduced to L per view), `torch.compile` (constant shapes), and the 8×B200 budget.
 
 **Block:** pre-norm RMSNorm (no bias), SwiGLU FFN (d_ff ≈ 2/3·2·d_model), GQA 4:1 (`n_kv_heads = n_heads//4`, KV shared via `repeat_kv`), SDPA backend (Flash Attention 3 auto on Hopper/Blackwell, sdpa fallback, no eager). Dropout = 0 (view drop/mask is the regularizer). Xavier init on qkv/o/proj, residual scaled ×1/√(2·n_layers). Stochastic depth (p=0.1) only if n_layers ≥ 16.
 
@@ -92,7 +92,7 @@ The architecture must be sized to the dataset and the GPU budget.
 
 **Readout** (flag, identical forward): `meanpool` (default, `z = mean(h[mask])`, consistent with single-cell literature) or `cls` (`z = h[:,0]`, not polluted by padding). Both benchmarked. The representation of interest (probing, downstream) is z **pre-projection**.
 
-**Memory budget** (L=4096, batch=32, V=4, d_model=1024, bf16): the cost is V forward passes through the shared encoder (no separate predictor). Roughly ~25 GB/rank on GB200 (190 GB HBM) per view-pass, with margin to push L=8192 or batch=64; beyond that → FSDP or gradient checkpointing.
+**Memory budget** (L=4096, batch=32, V=4, d_model=1024, bf16): the cost is V forward passes through the shared encoder (no separate predictor). Roughly ~25 GB/rank on B200 (183 GB HBM) per view-pass, with margin to push L=8192 or batch=64; beyond that → gradient checkpointing or FSDP. The cluster is **8× B200** connected by NVLink; first target is DDP + gradient checkpointing.
 
 A later extension could add a **hierarchical encoder** with inductive biases built on hallmark pathways (à la hierarchical JEPA / HRM: two attention levels, an abstract level over gene-level tokens connected by pathway).
 
@@ -148,7 +148,17 @@ The hard part. Two approaches:
 
 ## Dataset
 
-We use **Tahoe-100M**. Understand the HuggingFace tables (meaning of each column) before building a precise dataloader.
+We use **Tahoe-100M** (`tahoebio/Tahoe-100M`): ~95.6M drug-perturbed single cells across **50 cancer cell lines**, **379 distinct drugs** (~1,100 drug×dose perturbations), vocabulary of **62,710 genes** (Ensembl release 109 / GRCh38). On the cluster it lives at `/data/tahoe-100m` (~429 GB parquet).
+
+### Tables (HuggingFace configs)
+
+- **`expression_data`** (main, ~95.6M rows, one per cell): `genes` (`list<int64>` gene token_ids), `expressions` (`list<float32>` raw UMI counts, aligned 1:1 with `genes`), `drug` (str; control = `"DMSO_TF"`), `sample` (str → `sample_metadata`), `cell_line_id` (str, Cellosaurus `CVCL_*` → `cell_line_metadata.Cell_ID_Cellosaur`), `moa-fine` (str), `canonical_smiles` (str), `pubchem_cid` (str), `plate` (str, `"plate1"`…`"plate14"`), `BARCODE_SUB_LIB_ID` (str → `obs_metadata`). The **first element of both `genes` and `expressions` is a CLS marker, stripped by position** (index 0); the remaining `expressions` are raw counts.
+- **`gene_metadata`** (62,710 rows): `token_id` (int64), `gene_symbol` (str), `ensembl_id` (str). The token_id ↔ ensembl_id map driving the ESMC/Evo2 embedding cache.
+- **`sample_metadata`** (PK `sample`): `plate`, `drug`, `drugname_drugconc`, mean QC stats. **`drugname_drugconc`** is the dose source — a string repr of a list of tuples, e.g. `"[('Infigratinib', 0.05, 'uM')]"` (control: `"[('DMSO_TF', 0.0, 'uM')]"`).
+- **`drug_metadata`** (379 rows, PK `drug`): `targets`, `moa-broad`, `moa-fine`, `human-approved`, `clinical-trials`, `canonical_smiles`, `pubchem_cid` (float64 here).
+- **`cell_line_metadata`** (one row per driver gene per line; 50 lines): `cell_name`, `Cell_ID_DepMap`, **`Cell_ID_Cellosaur`** (join key to `expression_data.cell_line_id`), **`Organ`** (e.g. `"Liver"`), driver-mutation fields.
+- **`obs_metadata`** (~100.6M rows, per-cell QC, PK `BARCODE_SUB_LIB_ID`): `gene_count`, `tscp_count`, `mread_count`, `pcnt_mito`, `S_score`, `G2M_score`, `phase`, `pass_filter`, `cell_line` (CVCL). Source of QC filters and the gene-count probe target.
+- **`pseudobulk_differential_expression`**: precomputed DESeq2-style DE (drug vs DMSO per line): `log2FoldChange`, `padj`, `concentration`, `Cell_ID_Cellosaur`, `drug`, … Use as a **probe/eval target**, not training input.
 
 ### Normalization / Count embedding (dataloader)
 
@@ -160,25 +170,35 @@ Value encoding is configurable between two benchmarked modes:
 
 ### Liver filtering
 
-There is no organ field in the main table. Build, upstream, the set of hepatic `cell_line_id` (Cellosaurus) via a join on `cell_line_metadata` (`Organ == "Liver"`), then filter the stream on that set. Note: these are **cancer lines** (HepG2, Huh-7…), not primary tissue.
+There is no organ field in `expression_data`. Build the hepatic set upstream by joining `cell_line_id` → `cell_line_metadata.Cell_ID_Cellosaur` and keeping `Organ == "Liver"`, then filter the stream on that set of `CVCL_*` ids. These are **cancer lines** (HepG2, Huh-7…), not primary tissue.
 
 ### Raw-format parsing
 
-Cells are **sparse**: `genes` = token IDs of non-zero genes, `expressions` = aligned **raw** counts. The **first entry of both is a CLS marker to strip**. Keep the sparse representation (1 gene = 1 token) for the JEPA; only **densify** (fixed gene vocabulary, ~62k) for the MAE/VAE/PCA baselines.
+Cells are **sparse**: `genes` = token_ids of non-zero genes, `expressions` = aligned raw counts. **Strip the first element of both by position** (the CLS marker; do not filter by a hardcoded token_id/value). Keep the sparse representation (1 gene = 1 token) for the JEPA; only **densify** into the fixed 62,710-gene vocabulary for the MAE/VAE/PCA baselines.
 
 ### Encoder dataloader output
 
-`__getitem__` returns the **whole cell** (variable length): `gene_token_ids`, encoded value (`bin_id` or log scalar depending on mode), plus probing metadata (`cell_line_id`, `Organ`, `drug`, `moa-fine`, `plate`, `sample`, dose). The V views (drop/mask, distinct gene vs pathway probabilities) are generated **on-the-fly in the collate**, never precomputed. The collate also **samples/pads** each view to a fixed budget of **L tokens** (+ attention mask for padding) for constant, compilable shapes; **L is configurable**.
+`__getitem__` returns the **whole cell** (variable length): `gene_token_ids`, the CP10k+log1p value (mode-agnostic; `bin_id` or log scalar produced at collate time), plus probing metadata (`cell_line_id`, `organ` from the prebuilt CVCL→Organ map, `drug`, `moa_fine` read from column `moa-fine`, `plate`, `sample`, `log_conc`, `canonical_smiles`). The V views (drop/mask, distinct gene vs pathway probabilities) are generated **on-the-fly in the collate**, never precomputed. The collate also **samples/pads** each view to a fixed budget of **L tokens** (+ attention mask for padding) for constant, compilable shapes; **L is configurable**.
 
 ### Schema facts to respect
 
-- Control = `drug == "DMSO_TF"`, matched by plate (same `plate` + same line) for the perturbator (see Control matching above).
-- **Dose** is absent from the main table: parse `drugname_drugconc` from `sample_metadata` (join on `sample`), format `[(name, concentration, unit)]`, normalize to **log concentration**.
+- Control = `drug == "DMSO_TF"` (in `expression_data`), matched by `(plate, cell_line_id)` for the perturbator (see Control matching above).
+- **Dose**: parse `sample_metadata.drugname_drugconc` (join on `sample`) with `ast.literal_eval` → `[(name, conc, unit)]`; assert `unit == "uM"`, convert `log_conc = log10(conc · 1e-6)`. Controls have `conc == 0.0` → mask/sentinel the dose (never `log10(0)`).
 - The perturbator action is featurized via `canonical_smiles`, **not** a hash of the drug name.
+- The `cell_line_metadata` join key is `Cell_ID_Cellosaur` (there is no `cell_line_id` column there); `obs_metadata` names its Cellosaurus column `cell_line`.
+- `pubchem_cid` dtype differs across tables (str in `expression_data`, float64 in `drug_metadata`) — cast to a nullable string.
+
+### Gene-embedding cache (ESMC + Evo2)
+
+Built **once, offline on the cluster**, keyed by `token_id → ensembl_id` (from `gene_metadata`, release 109/GRCh38). Per gene: resolve the canonical transcript (Ensembl REST, pinned to release 109), its biotype (`protein_coding` → coding), the canonical protein sequence (coding only) and the canonical transcript DNA (all genes). Then:
+- **ESMC** (`esmc-600m`, 1280-dim per residue): mean-pool over residues → one vector per coding gene. Non-coding genes get no protein term.
+- **Evo2** (`arcinstitute/evo2-*`; `d_evo2` read from the model config, not hardcoded): run the DNA sequence, extract the **layer + pooling chosen by a small validation sweep** (not assumed), → one vector per gene.
+
+Store two frozen lookup tables (ESMC `[1280]`, Evo2 `[d_evo2]`) plus an index `(token_id, ensembl_id, is_coding, esmc_offset, evo2_offset)` (~15-20 GB total). The encoder learns `Linear(1280→d_model)` and `Linear(d_evo2→d_model)` over these frozen vectors and sums with the count embedding. **Validate** before trusting the cache: confirm `genes`/`expressions` are 1:1 aligned and the first element is always the CLS marker on a sample of real rows.
 
 ### Preprocessing & cache (cluster)
 
-Prep pass: stream → filter liver → subsample → write to local NVMe (Arrow/Parquet or sparse memmap) each cell as `(gene_token_id, CP10k+log1p-normalized value)` — value **continuous and mode-agnostic**.
+Prep pass over `/data/tahoe-100m`: stream → filter liver (specialize phase) → subsample → write to local NVMe (Arrow/Parquet or sparse memmap) each cell as `(gene_token_id, CP10k+log1p-normalized value)` — value **continuous and mode-agnostic**.
 
 Normalization stats (per-gene quantile boundaries, pathway stats) are computed on the cached sample and stored separately; binning (mode B) or projection (mode A) is applied **at load time**, so we can change mode or K **without re-caching**.
 
