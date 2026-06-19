@@ -399,3 +399,144 @@ class BCS(nn.Module):
         invariance_loss = F.mse_loss(z1, z2).mean()
         total_loss = invariance_loss + self.lmbd * bcs
         return {"loss": total_loss, "bcs_loss": bcs, "invariance_loss": invariance_loss}
+
+
+######################################################
+# LeJEPA: SIGReg (sliced Epps-Pulley test) + the full multi-view objective.
+# Implemented per the official reference galilai-group/lejepa (MINIMAL.md), which
+# is the single source of truth for this loss. See CLAUDE.md "Views and the
+# LeJEPA objective". This supersedes BCS above (kept for backward-compat with the
+# image/video examples): BCS is 2-view with the opposite lambda convention.
+
+
+def _sigreg_all_reduce_mean(x):
+    """Average a tensor across distributed ranks, autograd-aware.
+
+    Turns each rank's local empirical characteristic function (ECF) into the ECF
+    of the *global* batch, so SIGReg tests Gaussianity over all ranks. Assumes
+    every rank contributes the same number of samples (drop_last=True). No-op when
+    distributed is not initialized (single-process / unit tests), in which case
+    SIGReg reduces exactly to the single-GPU MINIMAL.md formula.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return x
+    world = dist.get_world_size()
+    try:
+        # Differentiable all-reduce: backward all-reduces gradients too, so each
+        # rank's backward accounts for the full global batch.
+        from torch.distributed.nn.functional import all_reduce as _diff_all_reduce
+
+        x = _diff_all_reduce(x, op=dist.ReduceOp.SUM)
+    except Exception:
+        x = x.clone()
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+    return x / world
+
+
+class SIGReg(nn.Module):
+    """Sketched Isotropic Gaussian Regularization (LeJEPA), MINIMAL.md-exact.
+
+    Pushes the projected embedding distribution toward an isotropic Gaussian via a
+    sliced Epps-Pulley Gaussianity test: random 1-D projections (slices) are tested
+    against N(0,1) using a symmetric quadrature of the empirical characteristic
+    function on t in [0, t_max] (the ECF symmetry lets us integrate the half-range).
+
+    Args:
+        num_slices: number of random projections drawn fresh each forward.
+        knots: number of quadrature points on [0, t_max].
+        t_max: upper integration bound.
+    """
+
+    def __init__(
+        self, num_slices: int = 256, knots: int = 17, t_max: float = 3.0, seed: int = 0
+    ):
+        super().__init__()
+        self.num_slices = num_slices
+        self.seed = seed
+        self.step = 0
+        t = torch.linspace(0, t_max, knots, dtype=torch.float32)
+        dt = t_max / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[0] = dt
+        weights[-1] = dt  # trapezoid rule end-points
+        window = torch.exp(-t.square() / 2.0)  # Gaussian weight phi(t)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, proj: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            proj: [..., N, d_proj] projected embeddings (N = sample dim at -2).
+        Returns:
+            scalar SIGReg statistic (mean over leading dims and slices).
+        """
+        # Compute the Gaussianity test in fp32 for stability under AMP/bf16.
+        proj = proj.float()
+        # Draw the slice directions from a step-seeded generator so EVERY
+        # distributed rank uses the SAME projection matrix at each step (the ECF
+        # all-reduce is only meaningful if all ranks project identically) and runs
+        # are reproducible. The step advances every call (lock-step across ranks).
+        g = torch.Generator(device=proj.device)
+        g.manual_seed(self.seed + self.step)
+        a = torch.randn(proj.size(-1), self.num_slices, device=proj.device, generator=g)
+        self.step += 1
+        a = a / a.norm(p=2, dim=0)  # L2-normalize each slice (column)
+        x_t = (proj @ a).unsqueeze(-1) * self.t  # [..., N, S, knots]
+        cos_mean = x_t.cos().mean(
+            -3
+        )  # ECF real part, averaged over N -> [..., S, knots]
+        sin_mean = x_t.sin().mean(-3)  # ECF imaginary part
+        cos_mean = _sigreg_all_reduce_mean(cos_mean)
+        sin_mean = _sigreg_all_reduce_mean(sin_mean)
+        err = (cos_mean - self.phi).square() + sin_mean.square()
+        statistic = (err @ self.weights) * proj.size(-2)  # [..., S], scaled by N
+        return statistic.mean()
+
+
+class LeJEPALoss(nn.Module):
+    """LeJEPA objective: centroid invariance over V views + lambda * SIGReg.
+
+        loss = lamb * SIGReg(proj) + (1 - lamb) * invariance(proj)
+
+    where ``proj`` are the V projected views, invariance is each view's squared
+    deviation from the per-cell mean over views, and ``lamb`` is small and constant
+    (reference ~0.02 -> strong invariance bias). Heuristics-free: no teacher/EMA,
+    no stop-grad, no predictor, no loss schedulers (see CLAUDE.md).
+
+    The projector is owned here so it is used *only* by the loss; the representation
+    of interest for probing/downstream is the encoder output *pre*-projection. The
+    projector output is intentionally NOT L2-normalized: SIGReg targets an isotropic
+    Gaussian, and projecting onto a sphere would contradict that target.
+    """
+
+    def __init__(
+        self,
+        projector: nn.Module | None = None,
+        lamb: float = 0.02,
+        num_slices: int = 256,
+        knots: int = 17,
+        t_max: float = 3.0,
+    ):
+        super().__init__()
+        self.projector = nn.Identity() if projector is None else projector
+        self.lamb = lamb
+        self.sigreg = SIGReg(num_slices=num_slices, knots=knots, t_max=t_max)
+
+    def forward(self, views: torch.Tensor) -> dict:
+        """
+        Args:
+            views: [V, N, d_model] encoder outputs (pre-projection), one per view.
+        Returns:
+            dict with 'loss', 'invariance_loss', 'sigreg_loss'.
+        """
+        v, n = views.shape[0], views.shape[1]
+        proj = self.projector(views.reshape(v * n, -1)).reshape(
+            v, n, -1
+        )  # [V, N, d_proj]
+        inv_loss = (proj.mean(0) - proj).square().mean()
+        sigreg_loss = self.sigreg(proj)
+        loss = self.lamb * sigreg_loss + (1.0 - self.lamb) * inv_loss
+        return {"loss": loss, "invariance_loss": inv_loss, "sigreg_loss": sigreg_loss}

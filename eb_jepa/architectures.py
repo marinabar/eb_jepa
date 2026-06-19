@@ -3,7 +3,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import average_precision_score
 
 from eb_jepa.nn_utils import TemporalBatchMixin, init_module_weights
 
@@ -205,9 +204,15 @@ class ResUNet(TemporalBatchMixin, nn.Module):
 
 
 class Projector(nn.Module):
-    """MLP projector built from a spec string like '256-512-128'."""
+    """MLP projector built from a spec string like '256-512-128'.
 
-    def __init__(self, mlp_spec):
+    Hidden layers are Linear + BatchNorm1d + ReLU; the final layer is a bias-free
+    Linear. ``l2_norm`` optionally L2-normalizes the output. For the LeJEPA loss
+    this MUST stay False (SIGReg targets an isotropic Gaussian, not a sphere); it
+    is exposed only for sphere-based objectives (e.g. SimCLR-style baselines).
+    """
+
+    def __init__(self, mlp_spec, l2_norm=False):
         super().__init__()
         layers = []
         f = list(map(int, mlp_spec.split("-")))
@@ -218,9 +223,13 @@ class Projector(nn.Module):
         layers.append(nn.Linear(f[-2], f[-1], bias=False))
         self.net = nn.Sequential(*layers)
         self.out_dim = f[-1]  # Store output dimension as attribute
+        self.l2_norm = l2_norm
 
     def forward(self, x):
-        return self.net(x)
+        x = self.net(x)
+        if self.l2_norm:
+            x = F.normalize(x, p=2, dim=-1)
+        return x
 
 
 class DetHead(nn.Module):
@@ -244,6 +253,7 @@ class DetHead(nn.Module):
 
     @torch.no_grad()
     def score(self, preds, targets):
+        from sklearn.metrics import average_precision_score
 
         scores = []
         for T in range(len(preds) - 1):
