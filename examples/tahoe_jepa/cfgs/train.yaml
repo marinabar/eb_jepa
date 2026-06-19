@@ -1,0 +1,58 @@
+# Single-cell LeJEPA training — one config drives the whole run.
+
+meta:
+  seed: 0
+  run_dir: checkpoints/tahoe_jepa/dev
+
+data:
+  data_dir: /data/tahoe-cache/train   # preprocessed cache (or raw expression_data)
+  split: train
+  L: 4096                # tokens per view (fixed shape for torch.compile)
+  n_views: 4
+  view_mode: drop        # drop | mask
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: A          # A continuous | B quantile bins
+  n_bins: 50
+  n_genes: 62710
+  batch_size: 32
+  num_workers: 8
+  pin_mem: true
+  quantile_bins: ""      # path to QuantileBinner (mode B), e.g. /data/tahoe-cache/quantile_bins
+  maps_path: ""          # path to preprocess maps.pt (cell_line->organ, sample->log_conc)
+
+model:
+  d_model: 1024
+  n_layers: 12
+  n_heads: 16
+  n_kv_heads: 4          # GQA 4:1
+  use_cls: false
+  readout: meanpool      # meanpool | cls
+  proj_hidden: 2048
+  proj_dim: 128
+  grad_checkpoint: true
+  compile: true
+  gene_emb_cache: /data/gene_emb_cache   # dir from build_gene_embeddings.py ("random" = stub)
+
+loss:
+  lamb: 0.02             # SIGReg weight (small -> strong invariance bias)
+  num_slices: 1024       # SIGReg projections (large for high-dim)
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100
+  lr: 0.002
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+training:
+  amp: true              # bf16 autocast
+  log_every: 50
+  ckpt_every_epoch: true
+
+wandb:
+  enabled: false
+  project: tahoe-jepa
