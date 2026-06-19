@@ -7,8 +7,11 @@ Runs once over ``/data/tahoe-100m`` to produce a training-ready cache:
      cell-level, to avoid leakage), assigned BEFORE caching.
   4. Stream + subsample expression_data, write per-split parquet shards storing the
      CP10k+log1p value (continuous, mode-agnostic).
-  5. Fit per-gene quantile boundaries (mode B) on a sample, stored separately so
-     mode/K can change without re-caching.
+  5. Fit per-gene quantile boundaries (mode B) over a configurable sample of cells
+     (``--quantile_cells``, default 10M), accumulated with a streaming per-gene
+     histogram so memory is independent of the sample size. The histogram, the
+     boundaries, and a small stats file are all saved separately so mode/K can
+     change without re-caching (re-derive boundaries from the saved histogram).
 
 Pure helpers (maps, split, stats) are unit-tested; the streaming cache write is
 a cluster operation. Run on the GPU box (data at /data/tahoe-100m, use uv).
@@ -16,7 +19,8 @@ a cluster operation. Run on the GPU box (data at /data/tahoe-100m, use uv).
 Usage (cluster):
     python -m eb_jepa.datasets.tahoe.preprocess run \
         --data_dir /data/tahoe-100m --out_dir /data/tahoe-cache \
-        --liver_only False --val_frac 0.1 --split_by cell_line_id --n_bins 50
+        --liver_only False --val_frac 0.1 --split_by cell_line_id \
+        --n_bins 64 --quantile_cells 10000000
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import torch
 
 from eb_jepa.datasets.tahoe.dataset import parse_log_conc
 from eb_jepa.datasets.tahoe.normalizer import (
+    GeneHistogram,
     QuantileBinner,
     cp10k_log1p,
     fit_quantile_boundaries,
@@ -96,7 +101,7 @@ def assign_split(group_key, val_groups: set) -> str:
 # --------------------------------------------------------------------------- #
 # Quantile-boundary fitting from a streamed sample                            #
 # --------------------------------------------------------------------------- #
-def fit_boundaries_from_cells(cells, n_genes: int, n_bins: int = 50) -> QuantileBinner:
+def fit_boundaries_from_cells(cells, n_genes: int, n_bins: int = 64) -> QuantileBinner:
     """Fit per-gene quantile bins from an iterable of (token_ids, raw_counts) cells.
 
     Pools CP10k+log1p values per gene across the sample, then computes boundaries.
@@ -113,6 +118,27 @@ def fit_boundaries_from_cells(cells, n_genes: int, n_bins: int = 50) -> Quantile
     return QuantileBinner(boundaries, n_bins=n_bins)
 
 
+def fit_histogram_from_cells(
+    cells,
+    n_genes: int,
+    n_hist_bins: int = 4096,
+    v_min: float = 0.0,
+    v_max: float = 10.0,
+) -> GeneHistogram:
+    """Accumulate a streaming per-gene histogram from an iterable of cells.
+
+    Memory-bounded counterpart to ``fit_boundaries_from_cells`` for large samples:
+    each cell is CP10k+log1p'd and folded into the fixed grid, holding no raw
+    values. Call ``.binner(n_bins)`` (or ``.quantile_boundaries(n_bins)``) after.
+    """
+    hist = GeneHistogram(n_genes, n_hist_bins=n_hist_bins, v_min=v_min, v_max=v_max)
+    for token_ids, counts in cells:
+        token_ids = torch.as_tensor(token_ids).long()
+        values = cp10k_log1p(torch.as_tensor(counts).float())
+        hist.update(token_ids, values)
+    return hist
+
+
 # --------------------------------------------------------------------------- #
 # Streaming cache write (cluster)                                             #
 # --------------------------------------------------------------------------- #
@@ -125,8 +151,12 @@ def run(
     liver_only: bool = False,
     val_frac: float = 0.1,
     split_by: str = "cell_line_id",
-    n_bins: int = 50,
+    n_bins: int = 64,
     n_genes: int = 62710,
+    quantile_cells: int = 10_000_000,
+    n_hist_bins: int = 4096,
+    hist_v_min: float = 0.0,
+    hist_v_max: float = 10.0,
     subsample: int = 0,
     seed: int = 0,
 ):
@@ -135,7 +165,15 @@ def run(
     Streams expression_data shards, strips the CLS marker, writes one parquet per
     split storing ``(genes, value)`` with the CP10k+log1p value, and saves the
     metadata maps + quantile boundaries under ``out_dir``.
+
+    Quantile boundaries are fit over ~``quantile_cells`` cells (default 10M; set 0
+    to use every cell) sampled across the *whole* dataset via a seeded per-row
+    Bernoulli, accumulated into a streaming ``GeneHistogram`` (``n_hist_bins`` grid
+    over ``[hist_v_min, hist_v_max]``) so memory is independent of the sample size.
+    The histogram, boundaries, and a stats file are all saved.
     """
+    import random
+
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -158,28 +196,63 @@ def run(
             f"No expression parquet under {data_dir}/{expression_glob}"
         )
 
-    # First pass: collect the group keys present (for the split) + a stats sample.
-    group_keys, stats_cells, kept = set(), [], 0
+    # Spread the quantile sample across the whole dataset: keep each cell with
+    # probability ~quantile_cells/total so the stats are not biased to head shards.
+    # (Liver subsets are small, so keep all of them; quantile_cells<=0 also = all.)
+    total_rows = sum(pq.read_metadata(f).num_rows for f in files)
+    keep_p = (
+        1.0
+        if (liver_only or quantile_cells <= 0)
+        else min(1.0, quantile_cells / max(total_rows, 1))
+    )
+    rng = random.Random(seed)
+
+    # First pass: collect the group keys present (for the split) + fit the
+    # streaming per-gene histogram on the sampled cells.
+    hist = GeneHistogram(n_genes, n_hist_bins, hist_v_min, hist_v_max)
+    group_keys, q_used, kept = set(), 0, 0
     for f in files:
         t = pq.read_table(f, columns=["genes", "expressions", split_by, "cell_line_id"])
+        g_acc, v_acc = [], []
         for i in range(t.num_rows):
             cvcl = t.column("cell_line_id")[i].as_py()
             if keep_lines is not None and cvcl not in keep_lines:
                 continue
             group_keys.add(t.column(split_by)[i].as_py())
-            if len(stats_cells) < 200_000:  # bounded sample for quantiles
+            take = (quantile_cells <= 0 or q_used < quantile_cells) and (
+                keep_p >= 1.0 or rng.random() < keep_p
+            )
+            if take:
                 g = t.column("genes")[i].values.to_numpy(zero_copy_only=False)[1:]
                 e = t.column("expressions")[i].values.to_numpy(zero_copy_only=False)[1:]
-                stats_cells.append((g, e))
+                g_acc.append(torch.from_numpy(g.astype("int64")))
+                v_acc.append(cp10k_log1p(torch.from_numpy(e.copy()).float()))
+                q_used += 1
             kept += 1
             if subsample and kept >= subsample:
                 break
+        if g_acc:
+            hist.update(torch.cat(g_acc), torch.cat(v_acc))
         if subsample and kept >= subsample:
             break
 
     _train_groups, val_groups = group_level_split(group_keys, val_frac, seed)
-    binner = fit_boundaries_from_cells(stats_cells, n_genes=n_genes, n_bins=n_bins)
-    binner.save(out / "quantile_bins")
+    binner = hist.binner(n_bins)
+    binner.save(out / "quantile_bins")  # [n_genes, n_bins-1] edges used by mode B
+    hist.save(out / "gene_count_histogram")  # re-derive boundaries for any n_bins
+    torch.save(
+        {
+            "quantile_cells_requested": quantile_cells,
+            "quantile_cells_used": q_used,
+            "keep_p": keep_p,
+            "total_rows": total_rows,
+            "n_bins": n_bins,
+            "n_hist_bins": n_hist_bins,
+            "hist_v_min": hist_v_min,
+            "hist_v_max": hist_v_max,
+        },
+        out / "quantile_stats.pt",
+    )
     torch.save(
         {"val_groups": sorted(val_groups), "split_by": split_by}, out / "split.pt"
     )
