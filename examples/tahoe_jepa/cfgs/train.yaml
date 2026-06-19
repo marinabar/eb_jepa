@@ -13,7 +13,7 @@ data:
   gene_keep_frac: 0.6
   gene_mask_frac: 0.3
   count_mode: A          # A continuous | B quantile bins
-  n_bins: 50
+  n_bins: 64
   n_genes: 62710
   batch_size: 32
   num_workers: 8

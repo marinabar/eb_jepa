@@ -2,10 +2,11 @@
 
 import torch
 
-from eb_jepa.datasets.tahoe.normalizer import QuantileBinner
+from eb_jepa.datasets.tahoe.normalizer import GeneHistogram, QuantileBinner
 from eb_jepa.datasets.tahoe.preprocess import (
     assign_split,
     fit_boundaries_from_cells,
+    fit_histogram_from_cells,
     group_level_split,
     liver_cell_lines,
 )
@@ -56,3 +57,33 @@ def test_fit_boundaries_from_cells():
     assert binner.boundaries.shape == (50, 7)
     bins = binner.bin(torch.arange(50), torch.ones(50))
     assert bins.min() >= 0 and bins.max() <= 7
+
+
+def test_gene_histogram_matches_exact_quantiles():
+    """Streaming histogram boundaries should approximate the exact fit closely."""
+    torch.manual_seed(0)
+    cells = [
+        (torch.randint(0, 20, (40,)), torch.randint(1, 200, (40,)).float())
+        for _ in range(500)
+    ]
+    n_bins = 16
+    exact = fit_boundaries_from_cells(cells, n_genes=20, n_bins=n_bins)
+    hist = fit_histogram_from_cells(cells, n_genes=20, n_hist_bins=4096)
+    approx = hist.binner(n_bins)
+    assert isinstance(hist, GeneHistogram)
+    assert approx.boundaries.shape == exact.boundaries.shape == (20, n_bins - 1)
+    # grid is fine (range 0..10 over 4096 bins) -> edges within ~1 grid step
+    assert torch.allclose(approx.boundaries, exact.boundaries, atol=0.05)
+
+
+def test_gene_histogram_save_load_and_rebin(tmp_path):
+    """Saved histogram round-trips and re-derives boundaries for any n_bins."""
+    torch.manual_seed(1)
+    cells = [(torch.randint(0, 10, (30,)), torch.randint(1, 100, (30,)).float())]
+    hist = fit_histogram_from_cells(cells, n_genes=10)
+    hist.save(tmp_path / "hist")
+    loaded = GeneHistogram.load(tmp_path / "hist")
+    assert loaded.n_observed == hist.n_observed
+    # same histogram -> identical boundaries; different n_bins changes width only
+    assert torch.equal(loaded.quantile_boundaries(32), hist.quantile_boundaries(32))
+    assert loaded.quantile_boundaries(64).shape == (10, 63)

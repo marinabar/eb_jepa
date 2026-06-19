@@ -54,7 +54,7 @@ class TahoeConfig:
     gene_mask_frac: float = 0.3  # mask: fraction of kept genes whose count is hidden
     # counts
     count_mode: str = "A"  # "A" continuous | "B" quantile bins
-    n_bins: int = 50  # mode B
+    n_bins: int = 64  # mode B
     n_genes: int = 62710  # vocabulary size (densify + binning)
     pad_token_id: int = 0  # padding gene id (ignored via attention mask)
     # loader

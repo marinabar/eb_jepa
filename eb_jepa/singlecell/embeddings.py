@@ -29,7 +29,7 @@ class CountEmbedding(nn.Module):
       is the MASK bin (the collator sets masked positions to ``n_bins``).
     """
 
-    def __init__(self, d_model: int, count_mode: str = "A", n_bins: int = 50):
+    def __init__(self, d_model: int, count_mode: str = "A", n_bins: int = 64):
         super().__init__()
         assert count_mode in ("A", "B")
         self.count_mode = count_mode
@@ -77,7 +77,7 @@ class GeneTokenEmbedding(nn.Module):
         evo2_table: torch.Tensor,
         coding_mask: torch.Tensor,
         count_mode: str = "A",
-        n_bins: int = 50,
+        n_bins: int = 64,
     ):
         super().__init__()
         assert esmc_table.shape[0] == n_genes and evo2_table.shape[0] == n_genes
@@ -113,7 +113,7 @@ class GeneTokenEmbedding(nn.Module):
         cache_dir: str | Path,
         d_model: int,
         count_mode: str = "A",
-        n_bins: int = 50,
+        n_bins: int = 64,
     ) -> "GeneTokenEmbedding":
         """Load the frozen ESMC/Evo2 cache produced by build_gene_embeddings.py."""
         import pyarrow.parquet as pq
@@ -149,7 +149,7 @@ class GeneTokenEmbedding(nn.Module):
         d_esmc: int = 1280,
         d_evo2: int = 512,
         count_mode: str = "A",
-        n_bins: int = 50,
+        n_bins: int = 64,
         coding_frac: float = 0.7,
         seed: int = 0,
     ) -> "GeneTokenEmbedding":
