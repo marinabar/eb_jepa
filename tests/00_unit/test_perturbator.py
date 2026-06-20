@@ -2,12 +2,23 @@
 
 import math
 
+import numpy as np
 import torch
 
 from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
+from eb_jepa.singlecell.perturbator.flow import (
+    flow_matching_loss,
+    ode_sample,
+    predict_perturbed,
+)
 from eb_jepa.singlecell.perturbator.losses import sliced_wasserstein
 from eb_jepa.singlecell.perturbator.matching import build_strata
 from eb_jepa.singlecell.perturbator.model import Perturbator
+from eb_jepa.singlecell.perturbator.visualize import (
+    build_dose_track,
+    monotonicity_score,
+    rank_combos,
+)
 
 
 class TestFeaturize:
@@ -186,3 +197,157 @@ class TestModel:
             opt.step()
         end = loss_now().item()
         assert end < start - 0.1  # a few SGD steps clearly reduce the OT loss
+
+
+class TestFlowMatching:
+    def _model(self, d=8, action_dim=24):
+        return Perturbator(
+            d_model=d, action_dim=action_dim, depth=2, d_cond=16,
+            time_conditioned=True,
+        )
+
+    def test_forward_backward_smoke(self):
+        torch.manual_seed(0)
+        feat = DrugFeaturizer(n_bits=16)
+        model = self._model(d=8, action_dim=feat.action_dim)
+        source = torch.randn(32, 8)
+        target = torch.randn(40, 8) + 2.0  # unequal cardinality + shift
+        action = feat.featurize("CCO", -6.0)
+        gen = torch.Generator().manual_seed(1)
+        loss = flow_matching_loss(model, source, target, action, generator=gen)
+        assert loss.ndim == 0 and torch.isfinite(loss) and loss.item() > 0
+        loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads, "no gradients flowed"
+        assert any(g.abs().sum() > 0 for g in grads), "all gradients are zero"
+
+    def test_velocity_requires_time_conditioning(self):
+        feat = DrugFeaturizer(n_bits=16)
+        direct = Perturbator(d_model=8, action_dim=feat.action_dim, depth=2, d_cond=16)
+        x = torch.randn(4, 8)
+        t = torch.zeros(4)
+        action = feat.featurize("CCO", -6.0)
+        try:
+            direct.velocity(x, t, action)
+            assert False, "velocity() must require time_conditioned=True"
+        except RuntimeError:
+            pass
+
+    def test_optimization_reduces_flow_loss(self):
+        torch.manual_seed(0)
+        feat = DrugFeaturizer(n_bits=16)
+        model = self._model(d=8, action_dim=feat.action_dim)
+        source = torch.randn(64, 8)
+        target = torch.randn(64, 8) + 2.5
+        action = feat.featurize("CCO", -6.0)
+        opt = torch.optim.Adam(model.parameters(), lr=0.02)
+
+        def loss_now():
+            g = torch.Generator().manual_seed(0)
+            return flow_matching_loss(model, source, target, action, generator=g).item()
+
+        start = loss_now()
+        for _ in range(60):
+            opt.zero_grad()
+            g = torch.Generator().manual_seed(123)
+            loss = flow_matching_loss(model, source, target, action, generator=g)
+            loss.backward()
+            opt.step()
+        assert loss_now() < start - 0.05
+
+
+class TestODESampler:
+    def test_identity_at_init(self):
+        # zero-init head -> velocity == 0 -> ODE is the identity map.
+        feat = DrugFeaturizer(n_bits=16)
+        model = Perturbator(
+            d_model=8, action_dim=feat.action_dim, depth=2, d_cond=16,
+            time_conditioned=True,
+        )
+        source = torch.randn(10, 8)
+        action = feat.featurize("CCO", -6.0)
+        for method in ("euler", "heun", "midpoint"):
+            out = ode_sample(model, source, action, n_steps=8, method=method)
+            assert out.shape == source.shape
+            assert torch.allclose(out, source, atol=1e-5), f"{method} not identity at init"
+
+    def test_constant_velocity_integration(self):
+        # Force a constant velocity field (bias-only head, gamma/beta still 0): the
+        # trunk output is the head bias for every (x, t), so the ODE over [0,1] must
+        # move every point by exactly that bias regardless of step count / method.
+        feat = DrugFeaturizer(n_bits=16)
+        model = Perturbator(
+            d_model=4, action_dim=feat.action_dim, depth=1, d_cond=8,
+            time_conditioned=True,
+        )
+        with torch.no_grad():
+            bias = torch.tensor([1.0, -2.0, 0.5, 3.0])
+            model.head.bias.copy_(bias)  # weight stays 0 -> output == bias
+        source = torch.zeros(5, 4)
+        action = feat.featurize("CCO", -6.0)
+        for method, steps in (("euler", 4), ("heun", 2), ("midpoint", 3)):
+            out = ode_sample(model, source, action, n_steps=steps, method=method)
+            assert torch.allclose(out, source + bias, atol=1e-4), method
+
+    def test_predict_perturbed_dispatch(self):
+        feat = DrugFeaturizer(n_bits=16)
+        flow = Perturbator(
+            d_model=6, action_dim=feat.action_dim, depth=1, d_cond=8,
+            time_conditioned=True,
+        )
+        direct = Perturbator(d_model=6, action_dim=feat.action_dim, depth=1, d_cond=8)
+        source = torch.randn(7, 6)
+        action = feat.featurize("CCO", -6.0)
+        a = predict_perturbed(flow, source, action, "flow_matching", n_steps=5)
+        b = predict_perturbed(direct, source, action, "direct")
+        assert a.shape == b.shape == (7, 6)
+
+
+class TestMonotonicity:
+    def test_perfect_monotone_track(self):
+        # straight, increasing-magnitude track -> score ~ 1.
+        c0 = np.zeros(3)
+        direction = np.array([1.0, 0.0, 0.0])
+        cents = np.stack([direction * m for m in (1.0, 2.0, 3.0, 4.0)])
+        m = monotonicity_score(c0, cents)
+        assert m["collinearity"] > 0.99
+        assert m["magnitude_monotonicity"] == 1.0
+        assert m["score"] > 0.99
+        assert np.allclose(m["displacements"], [1.0, 2.0, 3.0, 4.0])
+
+    def test_non_monotone_track_scores_lower(self):
+        c0 = np.zeros(2)
+        good = np.stack([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])
+        # zig-zag, non-increasing magnitude
+        bad = np.stack([[1.0, 0.0], [0.5, 1.0], [0.2, -0.5]])
+        sg = monotonicity_score(c0, good)["score"]
+        sb = monotonicity_score(c0, bad)["score"]
+        assert sg > sb
+
+    def test_single_dose_is_zero(self):
+        m = monotonicity_score(np.zeros(3), np.ones((1, 3)))
+        assert m["score"] == 0.0
+
+    def test_build_dose_track_and_rank(self):
+        # end-to-end on synthetic latents: a trained-ish flow model produces a
+        # ranked set of tracks with the expected dataclass shape.
+        torch.manual_seed(0)
+        feat = DrugFeaturizer(n_bits=16)
+        model = Perturbator(
+            d_model=6, action_dim=feat.action_dim, depth=2, d_cond=16,
+            time_conditioned=True,
+        )
+        control = torch.randn(40, 6)
+        t1 = build_dose_track(
+            model, feat, control, "drugA", "CCO", [-7.0, -6.0, -5.0],
+            objective="flow_matching", ode_steps=5, ode_method="euler",
+        )
+        t2 = build_dose_track(
+            model, feat, control, "drugB", "CCN", [-7.0, -6.0],
+            objective="flow_matching", ode_steps=5, ode_method="euler",
+        )
+        assert t1.dose_centroids.shape == (3, 6)
+        assert t1.control_centroid.shape == (6,)
+        ranked = rank_combos([t1, t2])
+        assert len(ranked) == 2
+        assert ranked[0].metrics["score"] >= ranked[1].metrics["score"]

@@ -1,0 +1,57 @@
+# Perturbator dose-shift visualization — frozen encoder + trained perturbator.
+# Produces visualizations/perturbator/dose_shift_<cell_line>.{png,pdf,svg}.
+
+meta:
+  seed: 0
+
+amp: true
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/shared/tahoe-100m/data
+  split: train
+  streaming: true
+  shuffle_buffer: 16384
+  batch_size: 512
+  num_workers: 4
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+
+encoder:
+  ckpt: /lustre/work/vivatech-unaite/ljung/runs/sub14/sub14_small/encoder.pt
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+  d_model: 256
+  n_heads: 4
+  n_layers: 2
+  d_ff: 1024
+  proj_dim: 128
+  num_bins: 16
+  genes_per_bin: 32
+  attention_activation: sigmoid
+
+perturbator:
+  ckpt: /lustre/work/vivatech-unaite/ljung/runs/perturbator/flow_small/perturbator_final.pt
+
+featurizer:
+  n_bits: 1024
+  radius: 2
+  use_descriptors: true
+
+model:
+  depth: 4
+  d_cond: 256
+  cond_hidden: 512
+  n_time_freqs: 64
+
+loss:
+  objective: flow_matching   # must match the trained perturbator
+  ode_steps: 20
+  ode_method: heun
+
+viz:
+  out_dir: visualizations/perturbator
+  n_cells: 200000            # cells to stream/encode for the figure
+  cell_lines: null           # null = every line with enough controls; or a list
+  control_drug: DMSO_TF
+  min_cells_per_group: 30    # min cells for control / each (drug, dose) group
+  min_doses: 2               # only plot drugs with >= this many doses
+  top_drugs: 5               # arrow-tracks per panel (ranked by monotonicity)
+  projector: pca             # pca (faithful linear arrows) | tsne (cluster shape)

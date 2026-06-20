@@ -1,68 +1,82 @@
-# Perturbator v1 training — one config drives the whole run.
-# Frozen encoder + FiLM perturbator, trained by sliced-Wasserstein OT with control
-# matching per stratum (cell_line_id, plate). See CLAUDE.md Part II.
+# Perturbator training — one config drives the whole run.
+# Frozen Subliminal-1.4 encoder + FiLM perturbator. Default objective = flow
+# matching (rectified conditional flow matching, ODE inference); control matching
+# is per stratum (cell_line_id, plate). See CLAUDE.md Part II.
+#
+# Sized to the small sub14 checkpoint on Dalia
+# (/lustre/work/vivatech-unaite/ljung/runs/sub14/sub14_small/encoder.pt):
+# d_model=256, n_layers=2, n_heads=4, num_bins=16, genes_per_bin=32.
 
 meta:
   seed: 0
-  run_dir: checkpoints/tahoe_perturbator/dev
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/perturbator/flow_small
 
 data:
-  data_dir: /data/tahoe-cache/train   # preprocessed cache (or raw expression_data)
+  data_dir: /lustre/work/vivatech-unaite/shared/tahoe-100m/data
   split: train
-  L: 4096                # tokens per cell encoded (fixed shape for the frozen encoder)
-  n_views: 1             # one clean view per cell — we need real latents, not augmented
-  view_mode: drop
-  gene_keep_frac: 1.0    # keep every gene (capped at L); no augmentation for the latents
-  gene_mask_frac: 0.0
-  count_mode: A          # must match the trained encoder
-  n_bins: 64
-  n_genes: 62713
-  batch_size: 256        # big batch -> many cells per stratum for the OT distributions
+  streaming: true
+  shuffle_buffer: 16384
+  batch_size: 512        # big batch -> many cells per stratum for the OT distributions
   num_workers: 8
   pin_mem: true
-  quantile_bins: ""      # path to QuantileBinner (mode B), if count_mode == B
-  maps_path: ""          # preprocess maps.pt (cell_line->organ, sample->log_conc)
+  max_cells: 0
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
 
 encoder:
-  ckpt: checkpoints/tahoe_jepa/dev/encoder.pt   # frozen encoder checkpoint (model_state_dict)
-  gene_emb_cache: random  # dir from build_gene_embeddings.py ("random" = stub/smoke)
-  # the architecture below MUST match the checkpoint
-  d_model: 1024
-  n_layers: 12
-  n_heads: 16
-  n_kv_heads: 4
-  use_cls: false
-  readout: meanpool
+  # Frozen Subliminal-1.4 checkpoint (saved by examples/tahoe_jepa/sub14_main.py).
+  ckpt: /lustre/work/vivatech-unaite/ljung/runs/sub14/sub14_small/encoder.pt
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+  # architecture below MUST match the checkpoint
+  d_model: 256
+  n_heads: 4
+  n_layers: 2
+  d_ff: 1024
+  proj_dim: 128
+  num_bins: 16
+  genes_per_bin: 32
+  attention_activation: sigmoid
 
 featurizer:
   n_bits: 1024           # Morgan fingerprint length (hash fallback if no rdkit)
   radius: 2
   use_descriptors: true  # append MolWt/MolLogP/TPSA/HAcceptors/HDonors/RotBonds
 
-model:                    # perturbator
+model:                    # perturbator (velocity net, sized ~ sub14 small)
   depth: 4
-  d_cond: 256            # action-embedding (FiLM conditioning) width
+  d_cond: 256            # action + time conditioning width (FiLM)
   cond_hidden: 512
+  n_time_freqs: 64       # sinusoidal time-embedding frequencies (flow matching)
 
 loss:
+  objective: flow_matching   # flow_matching | direct
+  # flow matching uses CFM (MSE on velocity); these apply to the direct objective
+  # and to the eval sliced-W metric:
   sw_slices: 256         # sliced-Wasserstein projections
   sw_p: 2
-  min_source: 2          # skip strata whose source/target is smaller than this
-  min_target: 2
+  min_source: 4          # skip strata whose source/target is smaller than this
+  min_target: 4
+  ode_steps: 20          # ODE integration steps at eval/inference (flow matching)
+  ode_method: heun       # euler | heun | midpoint
 
 optim:
   epochs: 50
-  max_steps: 0           # >0 caps total optimizer steps
-  lr: 0.001
+  max_steps: 20000       # >0 caps total optimizer steps
+  lr: 0.0005
   weight_decay: 0.01
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   betas: [0.9, 0.95]
+  max_grad_norm: 1.0
 
 training:
   amp: true              # bf16 autocast for the (frozen) encoder forward
-  log_every: 20
+  log_every: 25
   ckpt_every_epoch: true
+  max_minutes: 600
+
+eval:
+  eval_every: 500
+  eval_cells: 4000
 
 wandb:
   enabled: true
