@@ -163,19 +163,17 @@ def run_probe_suite(
 ) -> dict:
     """Run the standard classification + regression probes; return a metrics dict.
 
-    ``epochs`` (optional) caps probe-training length for fast periodic evals; when
-    ``None`` each probe trainer uses its own default.
+    ``epochs`` is accepted for backward compatibility but ignored: the probes are
+    fit closed-form / to convergence (logistic-regression and ridge), so there is no
+    training-budget to cap.
     """
-    clf_kw = {} if epochs is None else {"epochs": epochs}
-    reg_kw = {} if epochs is None else {"epochs": epochs}
+    del epochs  # no longer used (probes are not iterative)
     results = {}
     for key in ("organ", "cell_line_id", "drug", "sample", "moa_fine"):
         if key in meta and len(set(meta[key])) >= 2:
-            results[f"clf/{key}"] = train_classification_probe(
-                features, meta[key], **clf_kw
-            )
+            results[f"clf/{key}"] = train_classification_probe(features, meta[key])
     if "gene_count" in meta:
         results["reg/gene_count"] = train_regression_probe(
-            features, torch.tensor(meta["gene_count"]), **reg_kw
+            features, torch.tensor(meta["gene_count"])
         )
     return results
