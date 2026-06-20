@@ -121,10 +121,12 @@ def fig_isoflop(runs):
     if len(opt) >= 3:
         oc, op, ol = np.array(opt).T
         pN = np.polyfit(np.log(oc), np.log(op), 1)[0]  # N_opt ∝ C^pN
-        m, b = np.polyfit(np.log(op), np.log(ol), 1)   # smooth power-law fit L_opt ∝ N^m
-        nn = np.geomspace(op.min(), op.max(), 100)
-        ax.plot(nn, np.exp(b) * nn ** m, "--", color=INK, lw=2.6, zorder=6,
-                label=f"compute-optimal\n(N∝C^{pN:.2f})")
+        # compute-optimal loss with an irreducible floor: L_opt = E + A·N^(-q)
+        # (curves and flattens toward E instead of a pure-power-law straight line)
+        E, q, A, _ = fit_powerlaw(op, ol)
+        nn = np.geomspace(op.min(), op.max(), 200)
+        ax.plot(nn, E + A * nn ** (-q), "--", color=INK, lw=2.6, zorder=6,
+                label=f"compute-optimal\nL=E+A·N^(−{q:.2f})")
         ax.text(0.04, 0.06, f"optimal size ∝ C^{pN:.2f}", transform=ax.transAxes,
                 color=INK, fontsize=11, fontweight="bold")
     style(ax, "model size (params)", "loss at fixed compute", "IsoFLOP",
