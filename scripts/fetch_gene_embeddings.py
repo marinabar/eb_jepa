@@ -8,25 +8,26 @@ on the SSP Cloud MinIO (``minio.lab.sspcloud.fr``) into a local directory that
 ``GeneTokenEmbedding.from_cache`` can load directly (esmc.npy, evo2.npy,
 index.parquet, metadata.json).
 
-Credentials
------------
-The prefix is PRIVATE, so set the standard S3 env vars before running. On SSP
-Cloud / Onyxia these are injected into every service automatically; otherwise copy
-them from the MinIO console ("My Account" -> credentials):
+Access
+------
+The ``hacktheworld/`` prefix is PUBLIC, so the default mode needs NO credentials —
+it downloads over plain HTTPS. Use ``--auth`` only if the prefix is made private
+again; then set the standard S3 env vars (Onyxia injects them, or copy from the
+MinIO console) and ``uv pip install boto3``:
 
-    export AWS_ACCESS_KEY_ID=...
-    export AWS_SECRET_ACCESS_KEY=...
-    export AWS_SESSION_TOKEN=...          # STS tokens are temporary — refresh when expired
+    export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_SESSION_TOKEN=...
     export AWS_S3_ENDPOINT=minio.lab.sspcloud.fr   # optional; this is the default
 
-Never hard-code credentials here. ``boto3`` reads them from the environment.
+Never hard-code credentials here.
 
 Usage
 -----
-    uv pip install boto3
+    # public, no credentials (default)
     python scripts/fetch_gene_embeddings.py --out /data/gene_emb_cache
-    # if the prefix is ever made public, credential-free over plain HTTPS:
-    python scripts/fetch_gene_embeddings.py --out ./gene_emb_cache --public
+    # quick connectivity test (only the tiny metadata file)
+    python scripts/fetch_gene_embeddings.py --out /tmp/gef --files metadata.json
+    # authenticated fallback if the prefix is private
+    python scripts/fetch_gene_embeddings.py --out ./gene_emb_cache --auth
 """
 
 from __future__ import annotations
@@ -90,22 +91,27 @@ def main(argv=None):
     ap.add_argument("--bucket", default=DEFAULT_BUCKET)
     ap.add_argument("--prefix", default=DEFAULT_PREFIX)
     ap.add_argument(
-        "--public",
+        "--files",
+        nargs="+",
+        default=list(FILES),
+        help="subset of artifacts to fetch (default: all four)",
+    )
+    ap.add_argument(
+        "--auth",
         action="store_true",
-        help="anonymous HTTPS download (only works if the prefix is public)",
+        help="authenticated S3 via boto3 + AWS_* env creds (use if prefix is private)",
     )
     args = ap.parse_args(argv)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    fetch = fetch_public if args.public else fetch_authenticated
-    fetch(out, args.endpoint, args.bucket, args.prefix)
+    fetch = fetch_authenticated if args.auth else fetch_public
+    fetch(out, args.endpoint, args.bucket, args.prefix, files=tuple(args.files))
 
-    meta = json.loads((out / "metadata.json").read_text())
-    sizes = {f: (out / f).stat().st_size for f in FILES}
+    if "metadata.json" in args.files:
+        print("metadata:", json.loads((out / "metadata.json").read_text()))
+    print("sizes (bytes):", {f: (out / f).stat().st_size for f in args.files})
     print(f"OK -> {out}")
-    print("metadata:", meta)
-    print("sizes (bytes):", sizes)
 
 
 if __name__ == "__main__":
