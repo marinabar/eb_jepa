@@ -42,19 +42,18 @@ def fetch():
     return np.concatenate(C), np.concatenate(L), np.concatenate(P)
 
 
-def frontier(C, L, P, nbins=26):
+def frontier(C, L, P, nbins=46):
     bins = np.geomspace(C.min(), C.max(), nbins)
     idx = np.digitize(C, bins)
-    out, best = [], math.inf
+    out, best, bestp = [], math.inf, 0.0
     for b in range(1, len(bins)):
         m = idx == b
         if not m.any():
             continue
         j = np.argmin(L[m])
-        lo = L[m][j]
-        if lo < best:  # strict lower envelope = true frontier records
-            best = lo
-            out.append((math.sqrt(bins[b - 1] * bins[b]), lo, P[m][j]))
+        if L[m][j] < best:  # running min -> one monotone frontier point per populated bin
+            best, bestp = float(L[m][j]), float(P[m][j])
+        out.append((math.sqrt(bins[b - 1] * bins[b]), best, bestp))
     return np.array(out)
 
 
@@ -92,9 +91,9 @@ def main():
     ax.tick_params(colors=MUTED)
     ax.set_xlabel("training compute (FLOPs)", color=MUTED)
     ax.set_ylabel("loss − E  (irreducible removed)", color=MUTED)
-    ax.set_title("sub14 — compute-optimal frontier", color=INK, fontweight="bold",
+    ax.set_title("compute-optimal frontier", color=INK, fontweight="bold",
                  loc="left", pad=18)
-    ax.text(0, 1.015, "loss minus irreducible floor vs compute; a power law is a line",
+    ax.text(0, 1.015, "loss minus irreducible floor vs compute",
             transform=ax.transAxes, color=MUTED, fontsize=8.5)
     ax.legend(frameon=False, fontsize=9.5, labelcolor=INK)
     cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
