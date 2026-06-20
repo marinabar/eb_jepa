@@ -215,6 +215,13 @@ def train(cfg, device=None):
             amp=cfg.training.get("amp", True),
         )
         logger.info(f"t-SNE snapshot @ step {step} -> {path}")
+        if run is not None:
+            import wandb
+
+            run.log(
+                {"tsne/representation": wandb.Image(path, caption=f"step {step}")},
+                step=step,
+            )
 
     tsne_every = int(cfg.get("eval", {}).get("tsne_every", 0)) if do_tsne else 0
     if do_tsne:
