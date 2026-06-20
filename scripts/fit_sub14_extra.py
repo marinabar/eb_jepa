@@ -119,11 +119,13 @@ def fig_isoflop(runs):
                        edgecolor=c, lw=2.2, zorder=5)
             opt.append((C0, xs[j], ys[j]))
     if len(opt) >= 2:
-        oc, op, _ = np.array(opt).T
-        # compute-optimal size scaling N_opt ~ C^p
+        oc, op, ol = np.array(opt).T
+        order = np.argsort(op)
+        ax.plot(op[order], ol[order], "--", color=INK, lw=2.4, zorder=6,
+                label="compute-optimal")  # trendline through the minima
         p = np.polyfit(np.log(oc), np.log(op), 1)[0]
         ax.text(0.04, 0.06, f"optimal size ∝ C^{p:.2f}", transform=ax.transAxes,
-                color=INK, fontsize=10, fontweight="bold")
+                color=INK, fontsize=11, fontweight="bold")
     style(ax, "model size (params)", "loss at fixed compute", "IsoFLOP",
           "each curve = one compute budget; ◯ = compute-optimal size", logy=True)
     ax.legend(frameon=False, fontsize=9, labelcolor=INK, title="compute budget",
@@ -169,19 +171,24 @@ def fig_data(runs):
 
 
 def fig_isoarch(runs):
-    env = by_arch(runs, "C")
-    keys = sorted(env)
+    # one curve per model size; x = compute, y = converged loss (run endpoints, LR-decayed)
+    g = defaultdict(list)
+    for r in runs:
+        g[(r["params"], r["arch"])].append((float(r["C"][-1]), float(np.min(r["L"][-3:]))))
+    keys = sorted(g)
     cols = plt.cm.viridis(np.linspace(0, 0.9, len(keys)))
     fig, ax = plt.subplots(1, 2, figsize=(14, 5.8))
     bestloss = []
     for k, c in zip(keys, cols):
-        ex, ey = env[k]
-        ax[0].plot(ex, ey, "-", color=c, lw=2.0, label=f"{k[1]} ({k[0]/1e6:.0f}M)")
-        bestloss.append((k[0], ey.min()))
-    style(ax[0], "training compute (FLOPs)", "best loss so far",
-          "Per-architecture scaling", "each architecture's lower-loss envelope", logy=True)
+        pts = sorted(g[k])
+        C = np.array([p[0] for p in pts])
+        L = np.array([p[1] for p in pts])
+        ax[0].plot(C, L, "-o", color=c, ms=7, lw=1.9, label=f"{k[1]} ({k[0]/1e6:.0f}M)")
+        bestloss.append((k[0], float(L.min())))
+    style(ax[0], "training compute (FLOPs)", "converged loss",
+          "Loss vs compute, per model size", "each curve = one architecture; ● = a run (LR-decayed)", logy=True)
     ax[0].legend(frameon=False, fontsize=7.5, labelcolor=INK, ncol=2)
-    bl = np.array(bestloss)
+    bl = np.array(sorted(bestloss))
     ax[1].plot(bl[:, 0], bl[:, 1], "-o", color=ACC, ms=7, lw=1.6)
     style(ax[1], "model size (params)", "lowest loss achieved",
           "Best loss vs architecture size", "diminishing returns of width/depth", logy=True)
