@@ -124,7 +124,7 @@ def fig_isoflop(runs):
         # compute-optimal loss with an irreducible floor: L_opt = E + A·N^(-q)
         # (curves and flattens toward E instead of a pure-power-law straight line)
         E, q, A, _ = fit_powerlaw(op, ol)
-        nn = np.geomspace(op.min(), op.max(), 200)
+        nn = np.geomspace(P.min() * 0.8, P.max() * 1.3, 200)  # extend left & right of the data
         ax.plot(nn, E + A * nn ** (-q), "--", color=INK, lw=2.6, zorder=6,
                 label=f"compute-optimal\nL=E+A·N^(−{q:.2f})")
         ax.text(0.04, 0.06, f"optimal size ∝ C^{pN:.2f}", transform=ax.transAxes,
