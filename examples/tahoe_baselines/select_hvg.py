@@ -91,10 +91,17 @@ def run(
     n_cells: int = 100000,
     n_hvg: int = 512,
     out_dir: str = "/lustre/work/vivatech-unaite/shared/tahoe-cache",
+    metric: str = "variance",
     shuffle_buffer: int = 4000,
     seed: int = 0,
 ):
-    """Stream a sample, compute per-gene variance, save the top-N HVG panel."""
+    """Stream a sample, score genes by ``metric``, save the top-N panel.
+
+    ``metric``: "variance" (HVG, default), "prevalence" (genes expressed in the most
+    cells -> a dense per-cell input like sub14's expressed-gene sampling, no
+    discriminative cherry-pick), or "mean" (highest mean log-normalized expression).
+    Non-variance metrics save to ``hvg_{N}_{metric}.npy`` so the HVG panel is kept.
+    """
     cfg = TahoeConfig(
         data_dir=data_dir,
         streaming=True,
@@ -104,29 +111,37 @@ def run(
     dataset = TahoeIterableDataset(cfg, shuffle=True)
     gsum, gsumsq, gcount, seen = accumulate_stats(dataset, int(n_cells))
     var = gene_variance(gsum, gsumsq, seen)
+    mean = gsum / max(int(seen), 1)
+    prevalence = gcount.astype(np.float64)  # cells expressing each gene
+    scores = {"variance": var, "mean": mean, "prevalence": prevalence}
+    if metric not in scores:
+        raise ValueError(f"metric must be one of {list(scores)}, got {metric!r}")
+    score = scores[metric]
 
-    hvg = select_hvg(var, int(n_hvg))
+    order = np.argsort(-score, kind="stable")[: int(n_hvg)]
+    hvg = np.sort(order.astype(np.int64))
     n_expressed = int((gcount > 0).sum())
     logger.info(
-        f"selected {hvg.size} HVGs out of {n_expressed} ever-expressed genes "
+        f"selected {hvg.size} genes by {metric} out of {n_expressed} ever-expressed "
         f"({N_GENES_INDEX} index space)"
     )
 
     os.makedirs(out_dir, exist_ok=True)
-    npy_path = os.path.join(out_dir, f"hvg_{n_hvg}.npy")
-    json_path = os.path.join(out_dir, f"hvg_{n_hvg}.json")
+    suffix = "" if metric == "variance" else f"_{metric}"
+    npy_path = os.path.join(out_dir, f"hvg_{n_hvg}{suffix}.npy")
+    json_path = os.path.join(out_dir, f"hvg_{n_hvg}{suffix}.json")
     np.save(npy_path, hvg)
     with open(json_path, "w") as f:
         json.dump(
             {
-                "method": "variance_of_cp10k_log1p",
+                "method": metric,
                 "n_hvg": int(n_hvg),
                 "n_cells": int(seen),
                 "n_genes_index": N_GENES_INDEX,
                 "n_expressed_genes": n_expressed,
                 "data_dir": data_dir,
                 "token_ids": hvg.tolist(),
-                "variances": var[hvg].tolist(),
+                "score": score[hvg].tolist(),
             },
             f,
             indent=2,
