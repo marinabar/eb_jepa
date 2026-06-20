@@ -258,13 +258,6 @@ def train(cfg, device=None):
     def _eval(step: int):
         from examples.tahoe_jepa.eval_tsne import periodic_eval
 
-<<<<<<< Updated upstream
-        enc = model.module.encoder if is_ddp else model.encoder
-        paths = tsne_snapshot(
-            enc, eval_batch, eval_labels, tsne_dir, step, device,
-            classes=list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])),
-            chunk=int(cfg.eval.get("encode_chunk", 64)),
-=======
         metrics, path = periodic_eval(
             raw_encoder,
             eval_batch,
@@ -277,52 +270,10 @@ def train(cfg, device=None):
                 cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])
             ),
             chunk=int(cfg.eval.get("encode_chunk", 128)),
->>>>>>> Stashed changes
             perplexity=float(cfg.eval.get("perplexity", 30.0)),
             seed=cfg.meta.seed,
             amp=cfg.training.get("amp", True),
         )
-<<<<<<< Updated upstream
-        logger.info(f"t-SNE snapshot @ step {step} -> {len(paths)} panels in {tsne_dir}")
-        if run is not None:
-            import wandb
-
-            run.log(
-                {f"tsne/{c}": wandb.Image(p, caption=f"step {step}") for c, p in paths.items()},
-                step=step,
-            )
-
-    def _probe_eval(step: int):
-        from examples.tahoe_jepa.probe_eval import probe_report
-
-        enc = model.module.encoder if is_ddp else model.encoder
-        probe_dir = os.path.join(cfg.meta.run_dir, "probes")
-        scalars, spectrum_path = probe_report(
-            enc, eval_batch, device, probe_dir, step,
-            probe_epochs=int(cfg.eval.get("probe_epochs", 150)),
-            chunk=int(cfg.eval.get("encode_chunk", 64)),
-            amp=cfg.training.get("amp", True),
-        )
-        logger.info(
-            f"probe eval @ step {step} | "
-            + " | ".join(f"{k}={v:.4f}" for k, v in sorted(scalars.items()))
-        )
-        if run is not None:
-            import wandb
-
-            run.log(scalars, step=step)
-            run.log(
-                {"repr/spectrum": wandb.Image(spectrum_path, caption=f"step {step}")},
-                step=step,
-            )
-
-    tsne_every = int(cfg.get("eval", {}).get("tsne_every", 0)) if do_tsne else 0
-    probe_every = int(cfg.get("eval", {}).get("probe_every", 0)) if do_tsne else 0
-    if do_tsne:
-        _snapshot(0)  # baseline (random init)
-    if probe_every:
-        _probe_eval(0)  # baseline (random init)
-=======
         key = {
             k: v
             for k, v in metrics.items()
@@ -349,7 +300,6 @@ def train(cfg, device=None):
         _eval(0)  # baseline (random init)
     if is_ddp:
         dist.barrier()  # other ranks wait for rank 0's baseline eval
->>>>>>> Stashed changes
 
     # FLOP accounting (trained backbone) + wall-clock budget
     n_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
@@ -429,18 +379,11 @@ def train(cfg, device=None):
                 )
                 if run is not None:
                     run.log(metrics, step=step)
-<<<<<<< Updated upstream
-            if tsne_every and step % tsne_every == 0:
-                _snapshot(step)
-            if probe_every and step % probe_every == 0:
-                _probe_eval(step)
-=======
             if eval_every and step % eval_every == 0:
                 if do_eval:  # rank 0 runs probes + t-SNE on the held-out set
                     _eval(step)
                 if is_ddp:
                     dist.barrier()  # other ranks wait while rank 0 evaluates
->>>>>>> Stashed changes
             if max_steps and step >= max_steps:
                 stop = True
                 break
