@@ -100,7 +100,7 @@ def fig_isoflop(runs):
     env = by_arch(runs, "C")
     keys = sorted(env)  # by params
     P = np.array([k[0] for k in keys])
-    budgets = [3e16, 1e17, 3e17, 6e17]  # 30, 100, 300, 600 PF
+    budgets = [1e16, 3e16, 1e17, 3e17, 6e17]  # 10, 30, 100, 300, 600 PF
     cols = plt.cm.plasma(np.linspace(0.1, 0.85, len(budgets)))
     fig, ax = plt.subplots(figsize=(7.5, 6))
     opt = []
