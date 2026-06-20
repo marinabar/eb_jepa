@@ -67,49 +67,52 @@ def _labels_to_ids(labels):
     return ids, classes
 
 
+def _split(n: int, val_frac: float, seed: int):
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=g)
+    n_val = max(1, int(n * val_frac))
+    return perm[n_val:], perm[:n_val]  # (train_idx, val_idx)
+
+
 def train_classification_probe(
     features: torch.Tensor,
     labels: list,
-    epochs: int = 200,
-    lr: float = 1e-2,
     val_frac: float = 0.2,
     seed: int = 0,
+    C: float = 1.0,
+    max_iter: int = 2000,
 ):
-    """Train a detached linear probe; return imbalance-aware metrics on a holdout."""
+    """Linear logistic-regression probe fit **to convergence** (sklearn lbfgs) — the
+    optimum of the convex problem, NOT fixed-budget SGD, so the metric isn't biased
+    by a training schedule. Refit from scratch each eval on the held-out features.
+    Imbalance-aware (class_weight=balanced; balanced-accuracy + macro-F1 on a holdout).
+    """
+    from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import balanced_accuracy_score, f1_score
 
     ids, classes = _labels_to_ids(labels)
     keep = ids >= 0
-    features, ids = features[keep], ids[keep]
+    X = features[keep].float().numpy()
+    y = ids[keep].numpy()
     n_classes = len(classes)
-    if n_classes < 2:
-        return {
-            "n_classes": n_classes,
-            "balanced_accuracy": float("nan"),
-            "macro_f1": float("nan"),
-        }
-
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(features.shape[0], generator=g)
-    n_val = max(1, int(features.shape[0] * val_frac))
-    val_idx, tr_idx = perm[:n_val], perm[n_val:]
-
-    probe = LinearProbe(features.shape[1], n_classes)
-    opt = torch.optim.Adam(probe.parameters(), lr=lr)
-    xtr, ytr = features[tr_idx], ids[tr_idx]
-    for _ in range(epochs):
-        opt.zero_grad()
-        loss = nn.functional.cross_entropy(probe(xtr), ytr)
-        loss.backward()
-        opt.step()
-    with torch.no_grad():
-        pred = probe(features[val_idx]).argmax(-1)
-    y_true = ids[val_idx].numpy()
-    y_pred = pred.numpy()
+    nan = {
+        "n_classes": n_classes,
+        "balanced_accuracy": float("nan"),
+        "macro_f1": float("nan"),
+    }
+    if n_classes < 2 or X.shape[0] < 4:
+        return nan
+    tr, va = _split(X.shape[0], val_frac, seed)
+    tr, va = tr.numpy(), va.numpy()
+    if len(set(y[tr].tolist())) < 2:  # need >=2 classes in the train split
+        return {**nan, "chance": 1.0 / n_classes}
+    clf = LogisticRegression(max_iter=max_iter, C=C, class_weight="balanced")
+    clf.fit(X[tr], y[tr])
+    pred = clf.predict(X[va])
     return {
         "n_classes": n_classes,
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y[va], pred)),
+        "macro_f1": float(f1_score(y[va], pred, average="macro", zero_division=0)),
         "chance": 1.0 / n_classes,
     }
 
@@ -117,39 +120,41 @@ def train_classification_probe(
 def train_regression_probe(
     features: torch.Tensor,
     targets: torch.Tensor,
-    epochs: int = 300,
-    lr: float = 1e-2,
     val_frac: float = 0.2,
     seed: int = 0,
+    ridge: float = 1e-2,
 ):
-    """Train a detached linear regression probe; return R2 / explained variance."""
+    """Closed-form ridge-regression probe: the **exact least-squares optimum** solved
+    in one shot (NOT iterative — no training-budget bias). Features standardized on
+    the train split; bias term added (unregularized); solves
+    ``(XᵀX + ridge·I) w = Xᵀy``; reports R2 / explained variance on the holdout.
+    """
     from sklearn.metrics import explained_variance_score, r2_score
 
     targets = targets.float()
     finite = torch.isfinite(targets)
-    features, targets = features[finite], targets[finite]
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(features.shape[0], generator=g)
-    n_val = max(1, int(features.shape[0] * val_frac))
-    val_idx, tr_idx = perm[:n_val], perm[n_val:]
-
-    # standardize the target for stable training
-    mu, sd = targets[tr_idx].mean(), targets[tr_idx].std().clamp(min=1e-6)
-    probe = LinearProbe(features.shape[1], 1)
-    opt = torch.optim.Adam(probe.parameters(), lr=lr)
-    xtr, ytr = features[tr_idx], ((targets[tr_idx] - mu) / sd).unsqueeze(-1)
-    for _ in range(epochs):
-        opt.zero_grad()
-        loss = nn.functional.mse_loss(probe(xtr), ytr)
-        loss.backward()
-        opt.step()
-    with torch.no_grad():
-        pred = probe(features[val_idx]).squeeze(-1) * sd + mu
-    y_true = targets[val_idx].numpy()
-    y_pred = pred.numpy()
+    X = features[finite].double()
+    y = targets[finite].double()
+    n = X.shape[0]
+    if n < 4:
+        return {"r2": float("nan"), "explained_variance": float("nan")}
+    tr, va = _split(n, val_frac, seed)
+    Xtr, ytr, Xva, yva = X[tr], y[tr], X[va], y[va]
+    mu = Xtr.mean(0, keepdim=True)
+    sd = Xtr.std(0, keepdim=True).clamp(min=1e-6)
+    Xtr = (Xtr - mu) / sd
+    Xva = (Xva - mu) / sd
+    Xtr_b = torch.cat([Xtr, torch.ones(Xtr.shape[0], 1, dtype=Xtr.dtype)], 1)
+    Xva_b = torch.cat([Xva, torch.ones(Xva.shape[0], 1, dtype=Xva.dtype)], 1)
+    d = Xtr_b.shape[1]
+    reg = ridge * torch.eye(d, dtype=Xtr_b.dtype)
+    reg[-1, -1] = 0.0  # do not regularize the bias term
+    w = torch.linalg.solve(Xtr_b.T @ Xtr_b + reg, Xtr_b.T @ ytr)
+    pred = (Xva_b @ w).numpy()
+    yt = yva.numpy()
     return {
-        "r2": float(r2_score(y_true, y_pred)),
-        "explained_variance": float(explained_variance_score(y_true, y_pred)),
+        "r2": float(r2_score(yt, pred)),
+        "explained_variance": float(explained_variance_score(yt, pred)),
     }
 
 

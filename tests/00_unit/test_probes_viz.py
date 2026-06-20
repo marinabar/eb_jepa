@@ -33,7 +33,7 @@ def _separable(n_per=40, n_classes=3, d=8, noise=0.3, seed=0):
 class TestProbes:
     def test_classification_beats_chance(self):
         feats, labels = _separable()
-        m = train_classification_probe(feats, labels, epochs=150)
+        m = train_classification_probe(feats, labels)
         assert m["n_classes"] == 3
         assert m["balanced_accuracy"] > 0.7 > m["chance"]
         assert m["macro_f1"] > 0.7
@@ -41,7 +41,7 @@ class TestProbes:
     def test_classification_ignores_none_labels(self):
         feats, labels = _separable(n_per=20, n_classes=2)
         labels[0] = None  # should be dropped, not crash
-        m = train_classification_probe(feats, labels, epochs=50)
+        m = train_classification_probe(feats, labels)
         assert m["n_classes"] == 2
 
     def test_regression_recovers_linear_target(self):
@@ -49,8 +49,9 @@ class TestProbes:
         feats = torch.randn(200, 8)
         w = torch.randn(8)
         target = feats @ w + 0.05 * torch.randn(200)
-        m = train_regression_probe(feats, target, epochs=300)
-        assert m["r2"] > 0.5 and m["explained_variance"] > 0.5
+        m = train_regression_probe(feats, target)
+        # closed-form least squares on linear data -> near-perfect fit
+        assert m["r2"] > 0.95 and m["explained_variance"] > 0.95
 
     def test_extract_features_and_suite(self):
         cfg = TahoeConfig(data_dir="", L=16, n_views=1, n_genes=50, gene_keep_frac=1.0)

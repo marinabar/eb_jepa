@@ -15,7 +15,7 @@ import os
 import torch
 
 from eb_jepa.datasets.tahoe.dataset import TahoeCollator
-from eb_jepa.singlecell.visualize import plot_tsne_single, tsne_embed
+from eb_jepa.singlecell.visualize import plot_tsne_grid, plot_tsne_single, tsne_embed
 
 _CLASSES = ("organ", "cell_line_id", "drug", "moa_fine")
 
