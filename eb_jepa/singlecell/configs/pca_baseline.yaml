@@ -1,0 +1,37 @@
+# PCA baseline — full multi-organ Tahoe, SAME eval as the sub14 JEPA.
+#
+# Mirrors examples/tahoe_jepa/cfgs/sub14.yaml's data + eval + wandb sections so the
+# PCA baseline is scored on the identical held-out cells, probes and t-SNE as the
+# JEPA encoder. One fit, logged to wandb ONCE.
+#
+#   python -m eb_jepa.singlecell.pca_baseline run \
+#       --config eb_jepa/singlecell/configs/pca_baseline.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/mbarannik/eb_jepa/runs/pca_baseline
+
+data:
+  # full multi-organ stream (every cell line / organ) — NOT liver-filtered.
+  data_dir: /lustre/work/vivatech-unaite/shared/tahoe-100m/data
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt  # cell_line_to_organ + dose
+  streaming: true
+  shuffle_buffer: 16384
+  batch_size: 32             # unused by PCA, kept for TahoeConfig parity
+  n_genes: 62713             # index space = max Tahoe token_id (62712) + 1 (densify)
+
+pca:
+  n_components: 128          # match the JEPA proj/latent dim for a fair comparison
+  n_fit_cells: 8000          # densified cells used to fit PCA (disjoint from eval)
+
+eval:
+  enabled: true
+  eval_cells: 3000           # SAME held-out cells the JEPA is probed on
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]   # organ, cell line, drug MoA (+ drug)
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
+  run_name: pca_baseline
