@@ -19,6 +19,7 @@ Usage:
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from contextlib import nullcontext
@@ -84,6 +85,23 @@ def jepa_pair_loss(
 # --------------------------------------------------------------------------- #
 # Build                                                                       #
 # --------------------------------------------------------------------------- #
+def _set_lr(opt, base_lrs, step, total, warmup, min_lr) -> float:
+    """LeJEPA-style schedule: linear warmup then cosine decay to ``min_lr`` over the
+    run's own ``total`` steps (horizon = each run's compute budget, so the LR fully
+    decays by the end — required for clean loss-vs-compute scaling points). Applied
+    manually to every CompositeOptimizer param group."""
+    if step < warmup:
+        scale = step / max(1, warmup)
+        lrs = [b * scale for b in base_lrs]
+    else:
+        prog = (step - warmup) / max(1, total - warmup)
+        cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+        lrs = [min_lr + (b - min_lr) * cos for b in base_lrs]
+    for g, lr in zip(opt.param_groups, lrs):
+        g["lr"] = lr
+    return lrs[0]
+
+
 def measure_flops(model, gene_ids, bin_ids, pad) -> int:
     """Forward FLOPs of ONE view through the sub14 model (FlopCounterMode). Training
     FLOPs/step ≈ 3× (fwd+bwd) × n_views × this — the trained transformer + heads
@@ -424,6 +442,14 @@ def train(cfg, device=None):
     eval_enabled = bool(cfg.eval.get("enabled", False))
     eval_every = int(cfg.eval.get("eval_every", 0)) if eval_enabled else 0
 
+    # LeJEPA LR schedule (warmup + cosine decay) over this run's max_steps horizon.
+    lr_schedule = str(cfg.optim.get("lr_schedule", "none"))
+    sched_on = lr_schedule in ("cosine", "warmup_cosine") and max_steps > 0
+    base_lrs = [g["lr"] for g in opt.param_groups] if sched_on else None
+    base_adamw_lr = float(cfg.optim.get("adamw_lr", 2e-4))
+    warmup_steps = int(float(cfg.optim.get("warmup_ratio", 0.05)) * max_steps)
+    min_lr = float(cfg.optim.get("min_lr", 1e-6))
+
     autocast = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if (
@@ -533,6 +559,11 @@ def train(cfg, device=None):
                         f"fwd FLOPs/view={fwd:.3e} | train FLOPs/step={flops_per_step:.3e} | params={n_params:,}"
                     )
 
+            cur_lr = (
+                _set_lr(opt, base_lrs, step + 1, max_steps, warmup_steps, min_lr)
+                if sched_on
+                else base_adamw_lr
+            )
             opt.zero_grad(set_to_none=True)
             with autocast:
                 projs: list[torch.Tensor] = []
@@ -565,9 +596,7 @@ def train(cfg, device=None):
                     "loss": float(loss.detach().item()),
                     "invariance_loss": float(jepa.detach().item()),
                     "sigreg_loss": float(sigreg_avg.detach().item()),
-                    "lr": float(
-                        cfg.optim.get("adamw_lr", 2e-4)
-                    ),  # constant (no scheduler)
+                    "lr": float(cur_lr),  # warmup+cosine when lr_schedule set
                     "epoch": epoch,
                     "data/cells_seen": cells,
                     "data/tokens_seen": cells * n_views * g_per_view,

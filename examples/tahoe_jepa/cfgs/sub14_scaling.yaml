@@ -58,19 +58,22 @@ optim:
   adamw_beta1: 0.9
   adamw_beta2: 0.95
   adamw_eps: 1.0e-8
-  epochs: 1000
-  max_steps: 0                # uncapped; bounded by training.max_minutes
+  epochs: 100000             # never the binding limit; max_steps caps each run
+  max_steps: 0               # set PER RUN by the sweep = that run's compute budget
   max_grad_norm: 1.0
+  lr_schedule: warmup_cosine  # LeJEPA schedule; cosine horizon = the run's max_steps
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
 
 training:
   native_bf16: true
   log_every: 20
-  ckpt_every_steps: 100000    # effectively off during the sweep
-  max_minutes: 35             # overridden by the sweep (shared wall-clock budget)
+  ckpt_every_steps: 100000    # periodic ckpt off; the FINAL ckpt is always saved
+  max_minutes: 240            # safety cap only; the real budget is max_steps
 
 eval:
   enabled: true
-  eval_every: 200
+  eval_every: 1000
   eval_cells: 1024
   encode_chunk: 128
   perplexity: 30.0
