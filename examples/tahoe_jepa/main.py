@@ -127,6 +127,23 @@ def move_batch(batch: dict, device) -> dict:
     }
 
 
+def measure_encoder_flops(encoder, batch) -> int:
+    """Forward FLOPs of the encoder over the V views of one (local) batch.
+
+    Measured with torch's FlopCounterMode (counts matmuls + SDPA attention) on the
+    trained backbone only (the frozen ESMC/Evo2 gather adds none). Training FLOPs per
+    step ≈ 3× this (forward + backward) × world_size — the scaling-law "trained
+    parts only" budget (CLAUDE.md Objectives).
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+
+    enc = getattr(encoder, "_orig_mod", encoder)  # unwrap torch.compile if present
+    counter = FlopCounterMode(display=False)
+    with torch.no_grad(), counter:
+        encode_views(enc, batch)
+    return counter.get_total_flops()
+
+
 # --------------------------------------------------------------------------- #
 # Training                                                                     #
 # --------------------------------------------------------------------------- #
@@ -155,6 +172,25 @@ def train(cfg, device=None):
         cell_line_to_organ=maps.get("cell_line_to_organ"),
         sample_to_logconc=maps.get("sample_to_logconc"),
     )
+    # DDP: give each rank a disjoint shard of the data (else all ranks see the same
+    # batches -> no data parallelism). collate_fn (the on-the-fly view generator) is
+    # carried over from the loader init_tahoe_data built.
+    sampler = None
+    if is_ddp:
+        from torch.utils.data import DataLoader, DistributedSampler
+
+        sampler = DistributedSampler(
+            dataset, num_replicas=world, rank=rank, shuffle=True, drop_last=True
+        )
+        train_loader = DataLoader(
+            dataset,
+            batch_size=cfg.data.batch_size,
+            sampler=sampler,
+            num_workers=cfg.data.num_workers,
+            pin_memory=cfg.data.pin_mem,
+            drop_last=True,
+            collate_fn=train_loader.collate_fn,
+        )
 
     # fixed eval set for t-SNE snapshots along training (rank 0 only)
     eval_batch = eval_labels = tsne_dir = None
@@ -185,7 +221,9 @@ def train(cfg, device=None):
     )
     max_steps = int(cfg.optim.get("max_steps", 0))
     # size the LR schedule to the actual run length (max_steps caps it)
-    total_steps = max_steps if max_steps > 0 else cfg.optim.epochs * max(1, len(train_loader))
+    total_steps = (
+        max_steps if max_steps > 0 else cfg.optim.epochs * max(1, len(train_loader))
+    )
     sched = CosineWithWarmup(
         opt,
         total_steps,
@@ -254,14 +292,43 @@ def train(cfg, device=None):
     if probe_every:
         _probe_eval(0)  # baseline (random init)
 
+    # FLOP accounting (trained backbone) + wall-clock budget
+    raw_module = model.module if is_ddp else model
+    raw_encoder = getattr(raw_module.encoder, "_orig_mod", raw_module.encoder)
+    n_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
+    max_minutes = float(cfg.training.get("max_minutes", 0))
+    flops_per_step = None  # global FLOPs/step (fwd+bwd, all ranks); set on first batch
+    cumulative_flops = 0.0
+    loop_start = time.time()
+
     step = 0
     stop = False
     for epoch in range(cfg.optim.epochs):
         if stop:
             break
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
         for batch in train_loader:
             batch = move_batch(batch, device)
+            if flops_per_step is None:
+                fwd = measure_encoder_flops(raw_encoder, batch)
+                flops_per_step = 3.0 * fwd * world  # fwd+bwd (~3x) across all ranks
+                if is_main(rank):
+                    logger.info(
+                        f"encoder fwd FLOPs/rank={fwd:.3e} | "
+                        f"train FLOPs/step (global)={flops_per_step:.3e} | "
+                        f"trainable params={n_params:,}"
+                    )
+                    if run is not None:
+                        run.log(
+                            {
+                                "flops/fwd_per_rank": fwd,
+                                "flops/per_step_global": flops_per_step,
+                                "model/trainable_params": n_params,
+                            },
+                            step=step,
+                        )
             opt.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=device.type,
@@ -273,12 +340,28 @@ def train(cfg, device=None):
             opt.step()
             sched.step()
             step += 1
+            cumulative_flops += flops_per_step
             if is_main(rank) and step % cfg.training.get("log_every", 50) == 0:
-                metrics = {k: v.detach().item() for k, v in out.items()}
-                metrics["lr"] = sched.get_last_lr()[0]
+                elapsed = max(time.time() - loop_start, 1e-9)
+                loss_m = {k: v.detach().item() for k, v in out.items()}
+                lr = sched.get_last_lr()[0]
+                metrics = {
+                    **loss_m,
+                    "lr": lr,
+                    "flops/cumulative": cumulative_flops,
+                    "flops/pflops_cumulative": cumulative_flops / 1e15,
+                    "flops/tflops_per_s": (cumulative_flops / 1e12) / elapsed,
+                    "throughput/cells_per_s": step
+                    * cfg.data.batch_size
+                    * world
+                    / elapsed,
+                }
                 logger.info(
-                    f"step {step} | "
-                    + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                    f"step {step} | loss={loss_m['loss']:.4f} "
+                    f"sigreg={loss_m['sigreg_loss']:.3f} inv={loss_m['invariance_loss']:.4f} "
+                    f"lr={lr:.2e} | {metrics['flops/pflops_cumulative']:.3f} PFLOP "
+                    f"| {metrics['flops/tflops_per_s']:.1f} TFLOP/s "
+                    f"| {metrics['throughput/cells_per_s']:.0f} cells/s"
                 )
                 if run is not None:
                     run.log(metrics, step=step)
@@ -287,6 +370,9 @@ def train(cfg, device=None):
             if probe_every and step % probe_every == 0:
                 _probe_eval(step)
             if max_steps and step >= max_steps:
+                stop = True
+                break
+            if max_minutes and (time.time() - loop_start) / 60.0 >= max_minutes:
                 stop = True
                 break
         if is_main(rank) and cfg.training.get("ckpt_every_epoch", True):

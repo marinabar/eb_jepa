@@ -1,0 +1,63 @@
+# Real DDP run on 8x B200 (torchrun --nproc_per_node=8), wall-clock budgeted.
+# Full-size encoder + real gene-emb cache + whole-dataset quantile bins. FLOPs of
+# the trained backbone are measured (FlopCounterMode) and logged to wandb.
+
+meta:
+  seed: 0
+  run_dir: /data/runs/tahoe_jepa_ddp
+
+data:
+  data_dir: /data/tahoe-cache/train
+  split: train
+  L: 4096
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: A
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 32            # per GPU -> global 256
+  num_workers: 8
+  pin_mem: true
+  quantile_bins: /data/tahoe-stats/quantile_bins
+  maps_path: /data/tahoe-cache/maps.pt
+  max_cells: 0
+
+model:
+  d_model: 1024
+  n_layers: 12
+  n_heads: 16
+  n_kv_heads: 4              # GQA 4:1
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 2048
+  proj_dim: 128
+  grad_checkpoint: true      # L=4096 x V=4 activation memory
+  compile: false             # off: stay within the time budget (no compile warmup)
+  gene_emb_cache: /data/gene_emb_cache
+
+loss:
+  lamb: 0.02
+  num_slices: 1024
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100                # capped by training.max_minutes
+  lr: 0.002
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+training:
+  amp: true
+  log_every: 5
+  ckpt_every_epoch: false
+  max_minutes: 4.5           # wall-clock budget
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

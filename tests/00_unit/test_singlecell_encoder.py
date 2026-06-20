@@ -165,6 +165,16 @@ class TestFromCache:
         assert embed.coding_mask[3].item() is True
 
 
+class TestFlopCount:
+    def test_measure_encoder_flops_positive(self):
+        from examples.tahoe_jepa.main import measure_encoder_flops
+
+        cfg = TahoeConfig(data_dir="", L=L, n_views=2, n_genes=N_GENES)
+        enc = _build()
+        flops = measure_encoder_flops(enc, _batch(cfg, n=4))
+        assert flops > 0
+
+
 class TestLeJEPAIntegration:
     def test_tiny_overfit_decreases_loss(self):
         torch.manual_seed(0)
