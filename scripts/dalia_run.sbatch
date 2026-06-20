@@ -1,15 +1,17 @@
 #!/bin/bash
-# Generic single-run launcher for one 4x GB200 node on Dalia. Driven by env vars set
-# at submit time (scripts/dalia_collapse_sweep.sh): RUN_NAME, LAMB, optional
-# MAX_STEPS / MAX_MIN / USE_PATHWAYS. One job == one node == one DDP run (torchrun
-# --nproc_per_node=4). Caches are redirected off the tiny home (inode quota).
+# Generic single-run launcher for ONE GB200 on Dalia. Driven by env vars set at submit
+# time (scripts/dalia_collapse_sweep.sh): RUN_NAME, LAMB, optional MAX_STEPS / MAX_MIN
+# / USE_PATHWAYS. Single-GPU (no DDP): the vivatech-unaite group has a hard cap of 3
+# concurrent GPUs (gres/gpu=3), so 1 GPU/run lets up to 3 runs run at once while
+# 4-GPU jobs could never schedule. batch_size is raised to 256 so the single-GPU
+# global batch matches the original DDP target (SIGReg quality). Caches off home.
 #SBATCH --partition=defq
 #SBATCH --reservation=Vivatech
 #SBATCH --account=vivatech-unaite
-#SBATCH --gres=gpu:b200:4
+#SBATCH --gres=gpu:b200:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=16
 #SBATCH --time=02:00:00
 #SBATCH --output=/lustre/work/vivatech-unaite/ljung/runs/collapse/%x-%j.out
 
@@ -36,10 +38,11 @@ if [ "${USE_PATHWAYS:-0}" = "1" ]; then
 fi
 
 echo "=== $(date -u +%T) START $RUN_NAME lamb=$LAMB steps=${MAX_STEPS:-6000} node=$(hostname) ==="
-"$WORK/venv-arm/bin/torchrun" --standalone --nproc_per_node=4 \
+"$WORK/venv-arm/bin/python" \
   -m examples.tahoe_jepa.main run \
   --config examples/tahoe_jepa/cfgs/collapse_sweep.yaml \
   --meta.run_dir "$WORK/runs/collapse/$RUN_NAME" \
+  --data.batch_size "${BS:-256}" \
   --loss.lamb "$LAMB" \
   --optim.max_steps "${MAX_STEPS:-6000}" \
   --training.max_minutes "${MAX_MIN:-110}" \

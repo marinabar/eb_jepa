@@ -26,7 +26,8 @@ data:
   count_mode: B
   n_bins: 64
   n_genes: 62713
-  batch_size: 64            # per GPU -> global 256 (x4 GPUs); bigger batch -> better SIGReg
+  batch_size: 256           # single-GPU global batch (sbatch overrides via BS=256);
+                            # group GPU cap is 3 -> 1 GPU/run, large batch -> good SIGReg
   num_workers: 8
   pin_mem: true
   quantile_bins: /lustre/work/vivatech-unaite/shared/tahoe-cache/quantile_bins

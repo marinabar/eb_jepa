@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Submit the PURE-LeJEPA collapse / lambda sweep on Dalia. Each run is an independent
-# sbatch job (1 node = 4x GB200); SLURM schedules them as nodes free up in the
-# Vivatech reservation — no node hogging, "do the most" automatically. Run from the
-# repo root on the Dalia login node (dalia2):
+# single-GPU sbatch job. The vivatech-unaite group is capped at 3 concurrent GPUs
+# (gres/gpu=3), so SLURM runs up to 3 of these at a time and queues the rest — "do
+# the most" within the cap, no hogging. Run from the repo root on the login node
+# (dalia2):
 #
 #   bash scripts/dalia_collapse_sweep.sh
 #
