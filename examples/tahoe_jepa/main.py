@@ -184,6 +184,8 @@ def train(cfg, device=None):
     if is_main(rank) and cfg.wandb.get("enabled", False):
         from eb_jepa.training_utils import setup_wandb
 
+        if cfg.wandb.get("entity"):
+            os.environ["WANDB_ENTITY"] = cfg.wandb.entity  # team; key stays in ~/.netrc
         run = setup_wandb(cfg.wandb.project, cfg, cfg.meta.run_dir, enabled=True)
 
     step = 0
