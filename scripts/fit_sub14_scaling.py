@@ -33,6 +33,8 @@ OGK = "probe/clf/organ/balanced_accuracy"
 def fetch():
     rows = []
     for r in wandb.Api().runs(f"{ENTITY}/{PROJECT}", filters={"group": GROUP}):
+        if r.state != "finished":  # only converged runs (LR fully decayed) on the curve
+            continue
         h = r.history(keys=[FK, EK, CLK, OGK], samples=4000, pandas=True)
         if h is None or h.empty or FK not in h:
             continue
