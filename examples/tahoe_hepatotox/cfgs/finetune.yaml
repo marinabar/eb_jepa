@@ -1,0 +1,92 @@
+# LIVER specialization of the sub14 SMALL encoder (CLAUDE.md phase 2).
+#
+# Warm-starts the pretrained small encoder and continues LeJEPA training on
+# LIVER cell lines only (Organ == "Liver"). Mirrors sub14_small.yaml exactly
+# (d256 / 2 layers / 4 heads, num_bins=16, genes_per_bin=32, sub14 recipe,
+# Muon+AdamW, no scheduler) — only the data stream (liver-filtered) and the
+# warmstart_checkpoint differ. The warm-start MUST keep the trained size so the
+# body + projector + thermometer count table + [CELL] token load key-for-key.
+#
+# Single GPU (liver subset is small, co-locatable with other jobs):
+#   /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python -m \
+#       examples.tahoe_hepatotox.finetune run \
+#       --config examples/tahoe_hepatotox/cfgs/finetune.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/hepatotox/liver_finetune
+
+data:
+  # Full Tahoe stream; the LiverTahoeIterableDataset filters to hepatic cells.
+  data_dir: /lustre/work/vivatech-unaite/shared/tahoe-100m/data
+  split: train
+  streaming: true
+  shuffle_buffer: 8000
+  batch_size: 32
+  num_workers: 6
+  pin_mem: true
+  max_cells: 0
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  num_bins: 16              # MUST match the warm-start checkpoint
+  genes_per_bin: 32         # max_genes_per_cell = 512 (matches checkpoint)
+  n_views: 4
+  binomial_subsample:
+    enabled: true
+    p_min: 0.5
+    p_max: 0.9
+
+model:
+  # EXACT pretrained small size — required for the small-encoder weights to load.
+  d_model: 256
+  n_heads: 4
+  n_layers: 2
+  d_ff: 1024
+  dropout: 0.1
+  proj_dim: 128
+  attention_activation: sigmoid
+  freeze_features: true
+  grad_checkpoint: false
+  compile: false
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+  # Warm-start from the pretrained small encoder (continue LeJEPA on liver).
+  warmstart_checkpoint: /lustre/work/vivatech-unaite/ljung/runs/sub14/sub14_small/encoder.pt
+
+loss:
+  sigreg_weight: 0.4         # sub14 recipe
+  jepa_loss: cosine
+  sigreg_slices: 256
+  sigreg_knots: 17
+  sigreg_t_max: 3.0
+
+optim:
+  muon_lr: 1.0e-4            # gentler than pretrain (finetune)
+  muon_weight_decay: 0.1
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  adamw_lr: 1.0e-4
+  adamw_weight_decay: 0.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 1.0e-8
+  epochs: 100
+  max_steps: 4000            # liver subset is small; cap the finetune
+  max_grad_norm: 1.0
+
+training:
+  native_bf16: true
+  log_every: 10
+  ckpt_every_steps: 1000
+  max_minutes: 120
+
+eval:
+  enabled: true
+  eval_every: 250
+  eval_cells: 1024
+  encode_chunk: 128
+  perplexity: 30.0
+  classes: [cell_line_id, drug, moa_fine]   # organ is constant (all liver)
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
