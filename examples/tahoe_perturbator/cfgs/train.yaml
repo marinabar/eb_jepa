@@ -1,0 +1,70 @@
+# Perturbator v1 training — one config drives the whole run.
+# Frozen encoder + FiLM perturbator, trained by sliced-Wasserstein OT with control
+# matching per stratum (cell_line_id, plate). See CLAUDE.md Part II.
+
+meta:
+  seed: 0
+  run_dir: checkpoints/tahoe_perturbator/dev
+
+data:
+  data_dir: /data/tahoe-cache/train   # preprocessed cache (or raw expression_data)
+  split: train
+  L: 4096                # tokens per cell encoded (fixed shape for the frozen encoder)
+  n_views: 1             # one clean view per cell — we need real latents, not augmented
+  view_mode: drop
+  gene_keep_frac: 1.0    # keep every gene (capped at L); no augmentation for the latents
+  gene_mask_frac: 0.0
+  count_mode: A          # must match the trained encoder
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 256        # big batch -> many cells per stratum for the OT distributions
+  num_workers: 8
+  pin_mem: true
+  quantile_bins: ""      # path to QuantileBinner (mode B), if count_mode == B
+  maps_path: ""          # preprocess maps.pt (cell_line->organ, sample->log_conc)
+
+encoder:
+  ckpt: checkpoints/tahoe_jepa/dev/encoder.pt   # frozen encoder checkpoint (model_state_dict)
+  gene_emb_cache: random  # dir from build_gene_embeddings.py ("random" = stub/smoke)
+  # the architecture below MUST match the checkpoint
+  d_model: 1024
+  n_layers: 12
+  n_heads: 16
+  n_kv_heads: 4
+  use_cls: false
+  readout: meanpool
+
+featurizer:
+  n_bits: 1024           # Morgan fingerprint length (hash fallback if no rdkit)
+  radius: 2
+  use_descriptors: true  # append MolWt/MolLogP/TPSA/HAcceptors/HDonors/RotBonds
+
+model:                    # perturbator
+  depth: 4
+  d_cond: 256            # action-embedding (FiLM conditioning) width
+  cond_hidden: 512
+
+loss:
+  sw_slices: 256         # sliced-Wasserstein projections
+  sw_p: 2
+  min_source: 2          # skip strata whose source/target is smaller than this
+  min_target: 2
+
+optim:
+  epochs: 50
+  max_steps: 0           # >0 caps total optimizer steps
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+training:
+  amp: true              # bf16 autocast for the (frozen) encoder forward
+  log_every: 20
+  ckpt_every_epoch: true
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
