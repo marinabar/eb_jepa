@@ -1,0 +1,73 @@
+# LeJEPA on Tahoe-100M — REAL run (Dalia, 4x GB200 single node, streaming full data).
+# Launch: torchrun --nproc_per_node=4 -m examples.tahoe_jepa.main run \
+#         --config examples/tahoe_jepa/cfgs/dalia_full.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/lejepa_full
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/shared/tahoe-100m/data   # ALL 3388 shards
+  split: train
+  streaming: true        # IterableDataset: stream shards, shard across rank/workers
+  shuffle_buffer: 16384
+  L: 4096
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: B
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 24         # per-GPU (x4 GPUs x4 views)
+  num_workers: 6
+  pin_mem: true
+  quantile_bins: /lustre/work/vivatech-unaite/shared/tahoe-cache/quantile_bins
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+
+model:
+  d_model: 1024
+  n_layers: 12
+  n_heads: 16
+  n_kv_heads: 4
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 2048
+  proj_dim: 128
+  grad_checkpoint: true
+  compile: false
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+
+loss:
+  lamb: 0.02
+  num_slices: 1024
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100
+  max_steps: 8000        # sizes the cosine schedule; far below one epoch/rank
+  lr: 0.0015
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+eval:
+  enabled: true
+  eval_every: 500
+  eval_cells: 3000
+  encode_chunk: 128
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+training:
+  amp: true
+  log_every: 25
+  ckpt_every_epoch: true
+  max_minutes: 600       # wall-clock backstop (final checkpoint always saved)
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

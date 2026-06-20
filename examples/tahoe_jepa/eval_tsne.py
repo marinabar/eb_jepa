@@ -29,11 +29,15 @@ def build_eval_set(dataset, data_cfg, n_cells: int = 0, seed: int = 0, idx=None)
     excluded from SSL training); otherwise sample ``n_cells`` (seeded). ``labels``
     maps each probe class (+ ``sample``) to its per-cell values.
     """
-    if idx is None:
+    if idx is not None:
+        items = [dataset[i] for i in idx]
+    elif hasattr(dataset, "sample_items"):  # streaming IterableDataset (no index space)
+        items = dataset.sample_items(n_cells)
+    else:
         g = torch.Generator().manual_seed(seed)
         n = len(dataset)
         idx = torch.randperm(n, generator=g)[: min(n_cells, n)].tolist()
-    items = [dataset[i] for i in idx]
+        items = [dataset[i] for i in idx]
 
     ecfg = copy.deepcopy(data_cfg)
     ecfg.n_views = 1
