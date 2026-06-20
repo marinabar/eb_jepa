@@ -111,6 +111,18 @@ def fig_loss(runs):
     print(f"loss: E={E:.3f} alpha={alpha:.3f} R2={r2:.3f}")
 
 
+def fit_saturating(C, V):  # acc = G - B*C^(-beta) ; grid ceiling G, log-log fit of (G-acc)
+    C, V = np.asarray(C, float), np.asarray(V, float)
+    best = (1.0, 0.0, 0.0, -1e9)
+    for G in np.linspace(V.max() + 1e-3, min(1.0, V.max() + 0.25), 250):
+        y, x = np.log(G - V), np.log(C)
+        b1, b0 = np.polyfit(x, y, 1)
+        r2 = 1 - ((y - (b0 + b1 * x)) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-12)
+        if r2 > best[3]:
+            best = (G, -b1, math.exp(b0), r2)
+    return best  # G, beta, B, r2
+
+
 def fig_probe(runs):
     allC = np.concatenate([r["pC"] for r in runs if len(r["pC"])])
     allV = np.concatenate([r["pV"] for r in runs if len(r["pC"])])
@@ -127,21 +139,24 @@ def fig_probe(runs):
             best = float(allV[m][j])
             bp = float(allP[m][j])
         fc.append(math.sqrt(bins[b - 1] * bins[b])); fv.append(best); fp.append(bp)
+    fc, fv, fp = np.array(fc), np.array(fv), np.array(fp)
+    G, beta, B, r2 = fit_saturating(fc, fv)
     fig, ax = plt.subplots(figsize=(8, 6.2))
-    ax.scatter(allC, allV, c="#c7cfdb", s=10, alpha=0.5, zorder=1)  # all probe points (context)
-    ax.plot(fc, fv, color=INK, lw=2.0, ls="--", zorder=3, label="best-achievable frontier")
-    sc = ax.scatter(fc, fv, c=np.array(fp) / 1e6, cmap="viridis", s=80, zorder=4,
+    cc = np.geomspace(fc.min(), fc.max(), 200)
+    ax.plot(cc, G - B * cc ** (-beta), color=INK, lw=2.4, ls="--", zorder=3,
+            label=f"fit  acc = {G:.2f} − {B:.2g}·C^(−{beta:.2f})\nR²={r2:.3f}")
+    sc = ax.scatter(fc, fv, c=fp / 1e6, cmap="viridis", s=85, zorder=4,
                     edgecolor="white", lw=0.7,
                     norm=plt.cm.colors.LogNorm(allP.min() / 1e6, allP.max() / 1e6))
     axstyle(ax, "training compute (FLOPs)", "cell-line balanced accuracy",
             "downstream probe vs compute",
-            "best-achievable frontier; grey = all runs; colour = model size", logy=False)
+            "best-achievable frontier; colour = model size", logy=False)
     ax.legend(frameon=False, fontsize=9.5, labelcolor=INK, loc="upper left")
     cbar(fig, ax, sc, "model size (M params)")
     fig.tight_layout()
     for e in ("png", "pdf"):
         fig.savefig(f"{OUTP}.{e}", dpi=220, bbox_inches="tight")
-    print(f"probe: frontier max acc {max(fv):.3f}")
+    print(f"probe: ceiling G={G:.3f} beta={beta:.3f} R2={r2:.3f} max={fv.max():.3f}")
 
 
 def main():
