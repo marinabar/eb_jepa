@@ -123,6 +123,26 @@ class TestEncoder:
             SingleCellEncoder(embed, d_model=D_MODEL, use_cls=False, readout="cls")
 
 
+class TestEmbedNorm:
+    def test_embed_norm_ln_forward_and_balance(self):
+        from eb_jepa.singlecell.visualize import effective_rank
+
+        ids = torch.randint(2, N_GENES, (1, 40))
+        cv = torch.rand(1, 40) * 3
+        emb_ln = GeneTokenEmbedding.random(
+            N_GENES, D_MODEL, d_esmc=16, d_evo2=12, embed_norm="ln"
+        )
+        assert hasattr(emb_ln, "ln_count")
+        out = emb_ln(ids, count_value=cv)
+        assert out.shape == (1, 40, D_MODEL) and torch.isfinite(out).all()
+        # with per-component LayerNorm, evo2 is no longer swamped by the count term
+        with torch.no_grad():
+            evo2 = emb_ln.ln_evo2(emb_ln.evo2_proj(emb_ln.evo2_table[ids]))
+            count = emb_ln.ln_count(emb_ln.count_emb(count_value=cv))
+        ratio = count.norm(dim=-1).mean() / evo2.norm(dim=-1).mean()
+        assert 0.3 < ratio < 3.0  # balanced (was ~12x without norm)
+
+
 class TestFromCache:
     def test_from_cache_noncontiguous_token_ids(self, tmp_path):
         # Real Tahoe token_ids are non-contiguous (0-2 reserved, genes up to 62712).

@@ -69,9 +69,10 @@ class TrainModule(nn.Module):
 
 def build_gene_embedding(cfg) -> GeneTokenEmbedding:
     cache = cfg.model.get("gene_emb_cache", "random")
+    embed_norm = cfg.model.get("embed_norm", "none")
     if cache and cache != "random":
         return GeneTokenEmbedding.from_cache(
-            cache, cfg.model.d_model, cfg.data.count_mode, cfg.data.n_bins
+            cache, cfg.model.d_model, cfg.data.count_mode, cfg.data.n_bins, embed_norm
         )
     logger.warning("Using RANDOM gene embeddings (no cache) — smoke/dev only.")
     return GeneTokenEmbedding.random(
@@ -79,6 +80,7 @@ def build_gene_embedding(cfg) -> GeneTokenEmbedding:
         cfg.model.d_model,
         count_mode=cfg.data.count_mode,
         n_bins=cfg.data.n_bins,
+        embed_norm=embed_norm,
     )
 
 

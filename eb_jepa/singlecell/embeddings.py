@@ -78,6 +78,7 @@ class GeneTokenEmbedding(nn.Module):
         coding_mask: torch.Tensor,
         count_mode: str = "A",
         n_bins: int = 64,
+        embed_norm: str = "none",
     ):
         super().__init__()
         assert esmc_table.shape[0] == n_genes and evo2_table.shape[0] == n_genes
@@ -89,6 +90,18 @@ class GeneTokenEmbedding(nn.Module):
         self.esmc_proj = nn.Linear(esmc_table.shape[1], d_model, bias=False)
         self.evo2_proj = nn.Linear(evo2_table.shape[1], d_model, bias=False)
         self.count_emb = CountEmbedding(d_model, count_mode, n_bins)
+        # Optional per-component normalization: without it the count embedding (a
+        # function of one scalar -> ~1-D image, large norm at init) dominates the
+        # frozen gene-identity (ESMC/Evo2) terms ~10x, collapsing the token embedding
+        # to a low-rank curve. LayerNorm per component rebalances them so gene
+        # identity contributes -> higher-rank representation.
+        self.embed_norm = embed_norm
+        if embed_norm == "ln":
+            self.ln_esmc = nn.LayerNorm(d_model)
+            self.ln_evo2 = nn.LayerNorm(d_model)
+            self.ln_count = nn.LayerNorm(d_model)
+        elif embed_norm != "none":
+            raise ValueError(f"unknown embed_norm: {embed_norm}")
 
     def forward(
         self,
@@ -100,10 +113,16 @@ class GeneTokenEmbedding(nn.Module):
         """gene_token_ids: [..., L] long -> token embeddings [..., L, d_model]."""
         ids = gene_token_ids.long()
         esmc = self.esmc_proj(self.esmc_table[ids])  # [..., L, d_model]
-        # zero the protein term for non-coding genes
-        esmc = esmc * self.coding_mask[ids].unsqueeze(-1)
         evo2 = self.evo2_proj(self.evo2_table[ids])
         count = self.count_emb(count_value, count_bin, count_mask)
+        if self.embed_norm == "ln":  # rebalance the three components
+            esmc, evo2, count = (
+                self.ln_esmc(esmc),
+                self.ln_evo2(evo2),
+                self.ln_count(count),
+            )
+        # zero the protein term for non-coding genes (after norm -> stays zero)
+        esmc = esmc * self.coding_mask[ids].unsqueeze(-1)
         return esmc + evo2 + count
 
     # ---- constructors ---------------------------------------------------
@@ -114,6 +133,7 @@ class GeneTokenEmbedding(nn.Module):
         d_model: int,
         count_mode: str = "A",
         n_bins: int = 64,
+        embed_norm: str = "none",
     ) -> "GeneTokenEmbedding":
         """Load the frozen ESMC/Evo2 cache produced by build_gene_embeddings.py."""
         import pyarrow.parquet as pq
@@ -142,7 +162,14 @@ class GeneTokenEmbedding(nn.Module):
                 coding_mask[tok] = True
         assert d_evo2 == meta.get("d_evo2", d_evo2)
         return cls(
-            vocab_size, d_model, esmc_table, evo2_table, coding_mask, count_mode, n_bins
+            vocab_size,
+            d_model,
+            esmc_table,
+            evo2_table,
+            coding_mask,
+            count_mode,
+            n_bins,
+            embed_norm,
         )
 
     @classmethod
@@ -156,6 +183,7 @@ class GeneTokenEmbedding(nn.Module):
         n_bins: int = 64,
         coding_frac: float = 0.7,
         seed: int = 0,
+        embed_norm: str = "none",
     ) -> "GeneTokenEmbedding":
         """Random frozen tables — for unit tests / smoke runs before the real cache."""
         g = torch.Generator().manual_seed(seed)
@@ -163,4 +191,4 @@ class GeneTokenEmbedding(nn.Module):
         evo2 = torch.randn(n_genes, d_evo2, generator=g)
         coding = torch.rand(n_genes, generator=g) < coding_frac
         esmc = esmc * coding.unsqueeze(-1)
-        return cls(n_genes, d_model, esmc, evo2, coding, count_mode, n_bins)
+        return cls(n_genes, d_model, esmc, evo2, coding, count_mode, n_bins, embed_norm)
