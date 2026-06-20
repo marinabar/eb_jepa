@@ -1,0 +1,62 @@
+# Small end-to-end TEST run: real gene-emb cache + whole-dataset quantile bins,
+# a small encoder, and a capped dataset so it finishes in a few minutes and we can
+# confirm wandb logging. NOT a real training config (see train.yaml for that).
+
+meta:
+  seed: 0
+  run_dir: /data/runs/tahoe_jepa_test
+
+data:
+  data_dir: /data/tahoe-cache/train       # built by: preprocess run --stats_dir /data/tahoe-stats
+  split: train
+  L: 2048
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: A                            # continuous (mode B would load quantile_bins)
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 16
+  num_workers: 8
+  pin_mem: true
+  quantile_bins: /data/tahoe-stats/quantile_bins
+  maps_path: /data/tahoe-cache/maps.pt
+  max_cells: 8000                          # TEST: cap -> ~500 steps
+
+model:
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  n_kv_heads: 2
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 2048
+  proj_dim: 128
+  grad_checkpoint: false
+  compile: false                           # off for fast first-log (no compile warmup)
+  gene_emb_cache: /data/gene_emb_cache     # REAL ESMC+Evo2 cache (untouched)
+
+loss:
+  lamb: 0.02
+  num_slices: 512
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 1
+  lr: 0.001
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+training:
+  amp: true
+  log_every: 10
+  ckpt_every_epoch: false
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
