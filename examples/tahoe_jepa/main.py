@@ -206,7 +206,7 @@ def train(cfg, device=None):
         from examples.tahoe_jepa.eval_tsne import tsne_snapshot
 
         enc = model.module.encoder if is_ddp else model.encoder
-        path = tsne_snapshot(
+        paths = tsne_snapshot(
             enc, eval_batch, eval_labels, tsne_dir, step, device,
             classes=list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])),
             chunk=int(cfg.eval.get("encode_chunk", 64)),
@@ -214,18 +214,45 @@ def train(cfg, device=None):
             seed=cfg.meta.seed,
             amp=cfg.training.get("amp", True),
         )
-        logger.info(f"t-SNE snapshot @ step {step} -> {path}")
+        logger.info(f"t-SNE snapshot @ step {step} -> {len(paths)} panels in {tsne_dir}")
         if run is not None:
             import wandb
 
             run.log(
-                {"tsne/representation": wandb.Image(path, caption=f"step {step}")},
+                {f"tsne/{c}": wandb.Image(p, caption=f"step {step}") for c, p in paths.items()},
+                step=step,
+            )
+
+    def _probe_eval(step: int):
+        from examples.tahoe_jepa.probe_eval import probe_report
+
+        enc = model.module.encoder if is_ddp else model.encoder
+        probe_dir = os.path.join(cfg.meta.run_dir, "probes")
+        scalars, spectrum_path = probe_report(
+            enc, eval_batch, device, probe_dir, step,
+            probe_epochs=int(cfg.eval.get("probe_epochs", 150)),
+            chunk=int(cfg.eval.get("encode_chunk", 64)),
+            amp=cfg.training.get("amp", True),
+        )
+        logger.info(
+            f"probe eval @ step {step} | "
+            + " | ".join(f"{k}={v:.4f}" for k, v in sorted(scalars.items()))
+        )
+        if run is not None:
+            import wandb
+
+            run.log(scalars, step=step)
+            run.log(
+                {"repr/spectrum": wandb.Image(spectrum_path, caption=f"step {step}")},
                 step=step,
             )
 
     tsne_every = int(cfg.get("eval", {}).get("tsne_every", 0)) if do_tsne else 0
+    probe_every = int(cfg.get("eval", {}).get("probe_every", 0)) if do_tsne else 0
     if do_tsne:
         _snapshot(0)  # baseline (random init)
+    if probe_every:
+        _probe_eval(0)  # baseline (random init)
 
     step = 0
     stop = False
@@ -257,6 +284,8 @@ def train(cfg, device=None):
                     run.log(metrics, step=step)
             if tsne_every and step % tsne_every == 0:
                 _snapshot(step)
+            if probe_every and step % probe_every == 0:
+                _probe_eval(step)
             if max_steps and step >= max_steps:
                 stop = True
                 break

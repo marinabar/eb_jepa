@@ -15,7 +15,7 @@ import os
 import torch
 
 from eb_jepa.datasets.tahoe.dataset import TahoeCollator
-from eb_jepa.singlecell.visualize import plot_tsne_grid, tsne_embed
+from eb_jepa.singlecell.visualize import plot_tsne_single, tsne_embed
 
 _CLASSES = ("organ", "cell_line_id", "drug", "moa_fine")
 
@@ -83,10 +83,13 @@ def tsne_snapshot(
     reps = torch.cat(reps)
 
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"tsne_step{step:06d}.png")
     emb = tsne_embed(reps, seed=seed, perplexity=perplexity)
-    plot_tsne_grid(emb, {c: labels[c] for c in classes}, path, step=step)
+    paths = {}
+    for c in classes:
+        p = os.path.join(out_dir, f"tsne_{c}_step{step:06d}.png")
+        plot_tsne_single(emb, labels[c], p, name=c, step=step)
+        paths[c] = p
 
     if was_training:
         encoder.train()
-    return path
+    return paths  # {class_name -> image path}
