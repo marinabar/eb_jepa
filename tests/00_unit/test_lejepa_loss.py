@@ -28,6 +28,24 @@ class TestLeJEPALoss:
             assert k in out
             assert out[k].ndim == 0 and math.isfinite(out[k].item())
 
+    def test_projector_norm_variants(self):
+        for norm in ("bn", "ln", "none"):
+            proj = Projector("16-32-8", norm=norm)
+            out = proj(torch.randn(10, 16))
+            assert out.shape == (10, 8) and torch.isfinite(out).all()
+
+    def test_repr_variance_reg_penalizes_collapse(self):
+        # candidate 1: VICReg-style variance/covariance on the pre-projection rep
+        loss_fn = make_loss(repr_var_weight=1.0, repr_cov_weight=0.04)
+        spread = torch.randn(4, 64, 16)
+        collapsed = torch.zeros(4, 64, 16) + 0.001 * torch.randn(4, 64, 16)
+        out_s = loss_fn(spread)
+        out_c = loss_fn(collapsed)
+        assert "repr_var_loss" in out_s and "repr_cov_loss" in out_s
+        # a collapsed representation has near-zero per-dim std -> high variance loss
+        assert out_c["repr_var_loss"].item() > out_s["repr_var_loss"].item()
+        assert out_c["repr_var_loss"].item() > 0.5
+
     def test_convex_combination_exact(self):
         # The returned components must combine with the stated convention.
         lamb = 0.3

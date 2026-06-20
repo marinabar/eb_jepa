@@ -95,7 +95,8 @@ def build_train_module(cfg) -> TrainModule:
         grad_checkpoint=cfg.model.get("grad_checkpoint", False),
     )
     projector = Projector(
-        f"{cfg.model.d_model}-{cfg.model.proj_hidden}-{cfg.model.proj_dim}"
+        f"{cfg.model.d_model}-{cfg.model.proj_hidden}-{cfg.model.proj_dim}",
+        norm=cfg.model.get("proj_norm", "bn"),
     )
     loss_fn = LeJEPALoss(
         projector=projector,
@@ -103,6 +104,8 @@ def build_train_module(cfg) -> TrainModule:
         num_slices=cfg.loss.num_slices,
         knots=cfg.loss.get("knots", 17),
         t_max=cfg.loss.get("t_max", 3.0),
+        repr_var_weight=cfg.loss.get("repr_var_weight", 0.0),
+        repr_cov_weight=cfg.loss.get("repr_cov_weight", 0.0),
     )
     return TrainModule(encoder, loss_fn)
 

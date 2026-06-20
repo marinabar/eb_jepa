@@ -519,11 +519,34 @@ class LeJEPALoss(nn.Module):
         num_slices: int = 256,
         knots: int = 17,
         t_max: float = 3.0,
+        repr_var_weight: float = 0.0,
+        repr_cov_weight: float = 0.0,
     ):
         super().__init__()
         self.projector = nn.Identity() if projector is None else projector
         self.lamb = lamb
         self.sigreg = SIGReg(num_slices=num_slices, knots=knots, t_max=t_max)
+        # Optional anti-collapse regularization on the ENCODER representation itself
+        # (pre-projection), VICReg-style. SIGReg acts on the projector output, which a
+        # nonlinear BN projector can keep Gaussian even when the encoder rep collapses;
+        # these terms constrain the representation of interest directly.
+        self.repr_var_weight = repr_var_weight
+        self.repr_cov_weight = repr_cov_weight
+
+    def _repr_reg(self, views: torch.Tensor):
+        """VICReg variance (per-dim std hinged at 1) + covariance (off-diagonal
+        decorrelation) on the pre-projection representation, averaged over views."""
+        var_terms, cov_terms = [], []
+        for v in range(views.shape[0]):
+            z = views[v]  # [N, d]
+            n, d = z.shape
+            std = torch.sqrt(z.var(dim=0) + 1e-4)
+            var_terms.append(torch.relu(1.0 - std).mean())
+            zc = z - z.mean(0, keepdim=True)
+            cov = (zc.T @ zc) / max(1, n - 1)
+            off = cov - torch.diag(torch.diagonal(cov))
+            cov_terms.append(off.square().sum() / d)
+        return torch.stack(var_terms).mean(), torch.stack(cov_terms).mean()
 
     def forward(self, views: torch.Tensor) -> dict:
         """
@@ -539,4 +562,12 @@ class LeJEPALoss(nn.Module):
         inv_loss = (proj.mean(0) - proj).square().mean()
         sigreg_loss = self.sigreg(proj)
         loss = self.lamb * sigreg_loss + (1.0 - self.lamb) * inv_loss
-        return {"loss": loss, "invariance_loss": inv_loss, "sigreg_loss": sigreg_loss}
+        out = {"loss": loss, "invariance_loss": inv_loss, "sigreg_loss": sigreg_loss}
+        if self.repr_var_weight > 0 or self.repr_cov_weight > 0:
+            var_loss, cov_loss = self._repr_reg(views)
+            out["repr_var_loss"] = var_loss
+            out["repr_cov_loss"] = cov_loss
+            out["loss"] = (
+                loss + self.repr_var_weight * var_loss + self.repr_cov_weight * cov_loss
+            )
+        return out

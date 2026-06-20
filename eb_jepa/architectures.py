@@ -212,13 +212,18 @@ class Projector(nn.Module):
     is exposed only for sphere-based objectives (e.g. SimCLR-style baselines).
     """
 
-    def __init__(self, mlp_spec, l2_norm=False):
+    def __init__(self, mlp_spec, l2_norm=False, norm="bn"):
         super().__init__()
         layers = []
         f = list(map(int, mlp_spec.split("-")))
         for i in range(len(f) - 2):
             layers.append(nn.Linear(f[i], f[i + 1]))
-            layers.append(nn.BatchNorm1d(f[i + 1]))
+            if norm == "bn":
+                layers.append(nn.BatchNorm1d(f[i + 1]))
+            elif norm == "ln":
+                layers.append(nn.LayerNorm(f[i + 1]))
+            elif norm not in ("none", None):
+                raise ValueError(f"unknown projector norm: {norm}")
             layers.append(nn.ReLU(True))
         layers.append(nn.Linear(f[-2], f[-1], bias=False))
         self.net = nn.Sequential(*layers)
