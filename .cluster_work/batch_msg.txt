@@ -1,0 +1,23 @@
+gene-emb: add Ensembl POST batch resolver (~50x faster sequence resolution)
+
+The per-gene GET resolver issues ~3 HTTP round-trips per gene, so resolving the
+62,710-gene vocabulary took ~4+ hours and dominated the build wall-clock (the GPU
+embedding is comparatively cheap). Add EnsemblBatchRestResolver, which uses the
+Ensembl REST POST endpoints (up to 50 ids/request):
+
+- POST /lookup/id   -> biotype + canonical_transcript (versioned) for a batch
+- POST /sequence/id type=cdna    -> spliced transcript DNA for a batch
+- POST /sequence/id type=protein -> canonical protein for a batch
+
+This cuts ~188k requests down to ~3.5k. Verified on cluster: byte-identical
+sequences vs the GET resolver, ~18-90 ms/gene vs ~850 ms/gene. Note the POST
+/sequence/id endpoint 404s on versioned transcript ids, so the version suffix is
+stripped and results are keyed back by the bare id ("query" field in the response).
+
+- New SequenceResolver.resolve_batch() hook (base = per-gene loop, kept for "rest"
+  and "pyensembl"); build_cache now calls resolver.resolve_batch(records).
+- sequence_source default flipped to "rest_batch" (still selectable: "rest",
+  "pyensembl"). Writes the SAME per-gene disk cache, so a partial GET run resumes.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+

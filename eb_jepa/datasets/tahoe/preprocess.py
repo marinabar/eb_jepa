@@ -148,11 +148,12 @@ def run(
     expression_glob: str = "data/*.parquet",
     cell_line_metadata: str = "metadata/cell_line_metadata.parquet",
     sample_metadata: str = "metadata/sample_metadata.parquet",
+    gene_metadata: str = "metadata/gene_metadata.parquet",
     liver_only: bool = False,
     val_frac: float = 0.1,
     split_by: str = "cell_line_id",
     n_bins: int = 64,
-    n_genes: int = 62710,
+    n_genes: int = 62713,  # index space = max Tahoe token_id (62712) + 1, NOT gene count
     quantile_cells: int = 10_000_000,
     n_hist_bins: int = 4096,
     hist_v_min: float = 0.0,
@@ -191,6 +192,16 @@ def run(
         {"cell_line_to_organ": cl2organ, "sample_to_logconc": s2dose}, out / "maps.pt"
     )
 
+    # Index space = max token_id + 1 (Tahoe token_ids are non-contiguous, up to
+    # 62712; 0-2 are reserved). Derive it from gene_metadata so the per-gene
+    # histogram/binner never overflow; fall back to the n_genes arg if absent.
+    try:
+        gmd = _first_match(data_dir, gene_metadata)
+        tok = pq.read_table(gmd, columns=["token_id"]).column("token_id").to_pylist()
+        vocab = max(tok) + 1
+    except FileNotFoundError:
+        vocab = n_genes
+
     files = sorted(glob.glob(os.path.join(data_dir, expression_glob), recursive=True))
     if not files:
         raise FileNotFoundError(
@@ -215,7 +226,7 @@ def run(
 
     # First pass: collect the group keys present (for the split) + fit the
     # streaming per-gene histogram on the sampled cells.
-    hist = GeneHistogram(n_genes, n_hist_bins, hist_v_min, hist_v_max)
+    hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
     group_keys, q_used, kept = set(), 0, 0
     # dedupe in case split_by == "cell_line_id" (a column can't be requested twice)
     pass1_cols = list(dict.fromkeys(["genes", "expressions", split_by, "cell_line_id"]))

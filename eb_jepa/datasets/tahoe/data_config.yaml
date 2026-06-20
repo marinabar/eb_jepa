@@ -14,7 +14,7 @@ gene_mask_frac: 0.3               # mask: fraction of kept genes whose count is 
 # count encoding
 count_mode: A                     # A continuous | B quantile bins
 n_bins: 64                        # mode B
-n_genes: 62710                    # Tahoe vocabulary size
+n_genes: 62713                    # index space = max Tahoe token_id (62712) + 1
 pad_token_id: 0
 
 # loader

@@ -112,7 +112,9 @@ class Config:
 
     # --- Ensembl sequence resolution -------------------------------------------
     ensembl_release: int = 109  # PIN: Tahoe-100M is release 109 / GRCh38
-    sequence_source: str = "rest"  # "rest" (exact, default) or "pyensembl"
+    # "rest_batch" (POST bulk, ~50x fewer requests, default), "rest" (per-gene GET),
+    # or "pyensembl" (offline). rest_batch resolves the full vocab in minutes.
+    sequence_source: str = "rest_batch"
     rest_timeout: float = 30.0
     rest_max_retries: int = 5
     rest_backoff: float = 1.0  # base seconds for exponential backoff
@@ -304,6 +306,18 @@ class SequenceResolver:
         self._save_cache(rec)
         return rec
 
+    def resolve_batch(self, records: List[GeneRecord]) -> None:
+        """Resolve a whole list of genes, filling each record in place.
+
+        Base implementation is the simple per-gene loop (correct but slow for REST).
+        Bulk sources (see :class:`EnsemblBatchRestResolver`) override this to issue
+        a handful of POST requests instead of ~3 GETs per gene.
+        """
+        for i, rec in enumerate(records):
+            self.resolve(rec)
+            if (i + 1) % 500 == 0:
+                logger.info("  resolved %d/%d", i + 1, len(records))
+
     def _resolve_uncached(self, rec: GeneRecord) -> GeneRecord:
         raise NotImplementedError
 
@@ -460,6 +474,190 @@ class EnsemblRestResolver(SequenceResolver):
         return rec
 
 
+class EnsemblBatchRestResolver(EnsemblRestResolver):
+    """Bulk Ensembl REST resolver using the POST endpoints (~50x fewer requests).
+
+    The per-gene :class:`EnsemblRestResolver` issues ~3 GETs/gene, so 62,710 genes
+    take hours. Ensembl REST also exposes POST variants that accept up to 50 ids per
+    call:
+
+      * ``POST /lookup/id``  {"ids":[...]}             -> per-id dict incl. ``biotype``
+        and ``canonical_transcript`` (versioned id) -- no ``?expand`` parsing needed.
+      * ``POST /sequence/id`` {"ids":[...], "type":"cdna"}    -> spliced transcript DNA
+      * ``POST /sequence/id`` {"ids":[...], "type":"protein"} -> canonical protein
+
+    So the whole vocabulary resolves in ~3 * (N/50) requests (a few thousand) instead
+    of ~3*N (hundreds of thousands). At the 55k-req/hour Ensembl budget this is a few
+    minutes instead of hours. Results are written to the SAME per-gene disk cache as
+    the GET resolver, so the two are interchangeable and a partial GET run is reused.
+    """
+
+    POST_BATCH = 50  # Ensembl REST hard cap on ids per POST
+
+    def _post(self, path: str, payload: dict):
+        """POST a JSON endpoint with retries; returns parsed JSON or None."""
+        s = self._get_session()
+        url = f"{ENSEMBL_REST}{path}"
+        for attempt in range(self.cfg.rest_max_retries):
+            try:
+                resp = s.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    timeout=self.cfg.rest_timeout,
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+                if resp.status_code in (400, 404):
+                    return None
+                wait = self.cfg.rest_backoff * (2**attempt)
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = max(wait, float(retry_after))
+                    except ValueError:
+                        pass
+                logger.warning(
+                    "Ensembl POST %s -> %d; retry %d/%d in %.1fs",
+                    path,
+                    resp.status_code,
+                    attempt + 1,
+                    self.cfg.rest_max_retries,
+                    wait,
+                )
+                time.sleep(wait)
+            except Exception as e:  # network errors -> backoff and retry
+                wait = self.cfg.rest_backoff * (2**attempt)
+                logger.warning("Ensembl POST %s error %s; retry in %.1fs", path, e, wait)
+                time.sleep(wait)
+        logger.error(
+            "Ensembl POST %s failed after %d retries", path, self.cfg.rest_max_retries
+        )
+        return None
+
+    @staticmethod
+    def _chunked(seq, n):
+        for i in range(0, len(seq), n):
+            yield seq[i : i + n]
+
+    def resolve_batch(self, records: List[GeneRecord]) -> None:
+        # 0) Anything already on disk is loaded and skipped (resume-safe). Only the
+        #    still-unresolved genes go through the bulk passes.
+        todo: List[GeneRecord] = []
+        for rec in records:
+            cached = self._load_cache(rec.ensembl_id)
+            if cached is not None:
+                rec.transcript_id = cached.get("transcript_id")
+                rec.biotype = cached.get("biotype")
+                rec.is_coding = bool(cached.get("is_coding", False))
+                rec.protein_seq = cached.get("protein_seq")
+                rec.dna_seq = cached.get("dna_seq")
+            else:
+                todo.append(rec)
+        if not todo:
+            logger.info("Batch resolve: all %d genes already cached.", len(records))
+            return
+        logger.info(
+            "Batch resolve: %d/%d genes need resolution (POST batches of %d).",
+            len(todo),
+            len(records),
+            self.POST_BATCH,
+        )
+
+        # 1) Bulk gene lookup -> biotype + canonical transcript id (with version).
+        warned_assembly = False
+        n_batches = (len(todo) + self.POST_BATCH - 1) // self.POST_BATCH
+        for bi, batch in enumerate(self._chunked(todo, self.POST_BATCH)):
+            ids = [r.ensembl_id for r in batch]
+            res = self._post("/lookup/id", {"ids": ids}) or {}
+            for rec in batch:
+                info = res.get(rec.ensembl_id)
+                if not info:
+                    logger.warning(
+                        "No Ensembl lookup for %s; leaving sequences empty.",
+                        rec.ensembl_id,
+                    )
+                    continue
+                assembly = info.get("assembly_name")
+                if (
+                    assembly
+                    and "GRCh38" not in str(assembly)
+                    and not warned_assembly
+                ):
+                    logger.warning(
+                        "Gene %s assembly is %s, expected GRCh38 (release %d). "
+                        "(suppressing further assembly warnings)",
+                        rec.ensembl_id,
+                        assembly,
+                        self.cfg.ensembl_release,
+                    )
+                    warned_assembly = True
+                rec.biotype = info.get("biotype")
+                rec.is_coding = rec.biotype == "protein_coding"
+                rec.transcript_id = info.get("canonical_transcript")
+            if (bi + 1) % 20 == 0 or bi + 1 == n_batches:
+                logger.info("  lookup batch %d/%d", bi + 1, n_batches)
+
+        # 2) Bulk cDNA / protein. IMPORTANT: /lookup/id returns the canonical
+        #    transcript id WITH a version suffix (e.g. ENST00000373020.9), but
+        #    POST /sequence/id 404s on versioned ids -- it wants the bare id. So we
+        #    strip the version for the sequence query and key the result back by the
+        #    bare id (the response carries a "query" field == the bare id we sent).
+        def _bare(tx: Optional[str]) -> Optional[str]:
+            return tx.split(".")[0] if tx else tx
+
+        def _seq_pass(kind: str, sel) -> None:
+            # map bare transcript id -> the gene records that use it
+            tmap: Dict[str, List[GeneRecord]] = {}
+            for r in todo:
+                if r.transcript_id and sel(r):
+                    tmap.setdefault(_bare(r.transcript_id), []).append(r)
+            tx_ids = list(tmap.keys())
+            nb = (len(tx_ids) + self.POST_BATCH - 1) // self.POST_BATCH
+            for bi, batch in enumerate(self._chunked(tx_ids, self.POST_BATCH)):
+                res = self._post("/sequence/id", {"ids": batch, "type": kind})
+                got: Dict[str, Optional[str]] = {}
+                if isinstance(res, list):
+                    for sent, item in zip(batch, res):
+                        if isinstance(item, dict):
+                            key = item.get("query") or item.get("id") or sent
+                            got[_bare(key)] = item.get("seq")
+                elif isinstance(res, dict):
+                    got = {
+                        _bare(k): v.get("seq")
+                        for k, v in res.items()
+                        if isinstance(v, dict)
+                    }
+                for tx in batch:
+                    seq = got.get(tx)
+                    if seq is None:
+                        continue
+                    for rec in tmap.get(tx, []):
+                        if kind == "cdna":
+                            rec.dna_seq = seq
+                        else:
+                            rec.protein_seq = seq
+                if (bi + 1) % 20 == 0 or bi + 1 == nb:
+                    logger.info("  %s batch %d/%d", kind, bi + 1, nb)
+
+        _seq_pass("cdna", lambda r: True)
+        _seq_pass("protein", lambda r: r.is_coding)
+
+        # 3) Persist everything to the per-gene disk cache (atomic, resume-safe).
+        for rec in todo:
+            if rec.is_coding and not rec.protein_seq:
+                logger.warning(
+                    "Coding gene %s (%s) returned no protein sequence.",
+                    rec.ensembl_id,
+                    rec.transcript_id,
+                )
+            self._save_cache(rec)
+        logger.info("Batch resolve: wrote %d gene seq caches.", len(todo))
+
+
 def _pick_canonical_transcript(transcripts: List[dict]) -> Optional[dict]:
     """Pick the canonical transcript from an Ensembl ``Transcript`` list.
 
@@ -532,6 +730,8 @@ class PyensemblResolver(SequenceResolver):
 
 
 def make_resolver(cfg: Config) -> SequenceResolver:
+    if cfg.sequence_source in ("rest_batch", "batch"):
+        return EnsemblBatchRestResolver(cfg)
     if cfg.sequence_source == "rest":
         return EnsemblRestResolver(cfg)
     if cfg.sequence_source == "pyensembl":
@@ -1161,10 +1361,7 @@ def build_cache(cfg: Config) -> None:
         len(records),
         cfg.sequence_source,
     )
-    for i, rec in enumerate(records):
-        resolver.resolve(rec)
-        if (i + 1) % 500 == 0:
-            logger.info("  resolved %d/%d", i + 1, len(records))
+    resolver.resolve_batch(records)
 
     n_genes = len(records)
     coding = [r for r in records if r.is_coding and r.protein_seq]

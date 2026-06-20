@@ -96,6 +96,18 @@ def _write_tahoe_layout(root, n_shards=2, cells_per=12, n_genes=200, seed=0):
         pa.table({"Cell_ID_Cellosaur": lines, "Organ": ["Liver", "Lung"]}),
         str(root / "metadata" / "cell_line_metadata.parquet"),
     )
+    # gene_metadata drives vocab-size derivation (max token_id + 1)
+    toks = list(range(3, n_genes))
+    pq.write_table(
+        pa.table(
+            {
+                "token_id": toks,
+                "gene_symbol": [f"G{t}" for t in toks],
+                "ensembl_id": [f"ENSG{t:011d}" for t in toks],
+            }
+        ),
+        str(root / "metadata" / "gene_metadata.parquet"),
+    )
     pq.write_table(
         pa.table(
             {

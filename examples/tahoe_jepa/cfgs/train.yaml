@@ -14,7 +14,7 @@ data:
   gene_mask_frac: 0.3
   count_mode: A          # A continuous | B quantile bins
   n_bins: 64
-  n_genes: 62710
+  n_genes: 62713         # index space = max Tahoe token_id (62712) + 1
   batch_size: 32
   num_workers: 8
   pin_mem: true

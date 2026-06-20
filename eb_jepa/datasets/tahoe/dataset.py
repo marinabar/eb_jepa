@@ -56,7 +56,9 @@ class TahoeConfig:
     # counts
     count_mode: str = "A"  # "A" continuous | "B" quantile bins
     n_bins: int = 64  # mode B
-    n_genes: int = 62710  # vocabulary size (densify + binning)
+    n_genes: int = (
+        62713  # index space = max Tahoe token_id (62712) + 1 (densify/binning)
+    )
     pad_token_id: int = 0  # padding gene id (ignored via attention mask)
     # loader
     batch_size: int = 32
