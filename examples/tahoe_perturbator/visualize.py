@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ast
 import collections
+import csv
+import json
 import os
 
 import numpy as np
@@ -25,8 +27,8 @@ from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
 from eb_jepa.singlecell.perturbator.model import Perturbator
 from eb_jepa.singlecell.perturbator.visualize import (
     build_dose_track,
+    monotonicity_score,
     plot_dose_shift,
-    rank_combos,
 )
 from eb_jepa.singlecell.sub14.collator import Sub14Collator
 from eb_jepa.singlecell.sub14.features import load_pc_features, random_pc_features
@@ -148,6 +150,9 @@ def run(config: str = "examples/tahoe_perturbator/cfgs/visualize.yaml", **overri
     min_doses = int(cfg.viz.get("min_doses", 2))
 
     target_lines = cfg.viz.get("cell_lines") or sorted(set(cl[cl != None]))  # noqa: E711
+    rng4 = np.round(log_conc, 4)
+    eps = 1e-8
+    all_rows = []  # cherry-pick ranking table across every (cell_line, drug)
     for line in target_lines:
         line_mask = cl == line
         ctrl_mask = line_mask & (drug == control_name)
@@ -156,12 +161,12 @@ def run(config: str = "examples/tahoe_perturbator/cfgs/visualize.yaml", **overri
         control_latents = latents[torch.from_numpy(np.where(ctrl_mask)[0])]
 
         # build a track per drug that has >= min_doses doses with enough cells
-        tracks = []
+        scored = []  # (demo_score, DoseTrack)
         drugs_here = [d for d in set(drug[line_mask]) if d and d != control_name]
         for dname in drugs_here:
             dmask = line_mask & (drug == dname)
             doses = sorted(set(round(float(x), 4) for x in log_conc[dmask] if np.isfinite(x)))
-            doses = [d for d in doses if (dmask & (np.round(log_conc, 4) == d)).sum() >= min_cells]
+            doses = [d for d in doses if (dmask & (rng4 == d)).sum() >= min_cells]
             if len(doses) < min_doses:
                 continue
             sm = next((s for s in smiles[dmask] if s), None)
@@ -171,11 +176,57 @@ def run(config: str = "examples/tahoe_perturbator/cfgs/visualize.yaml", **overri
                 ode_steps=int(cfg.loss.get("ode_steps", 20)),
                 ode_method=str(cfg.loss.get("ode_method", "heun")),
             )
-            tracks.append(track)
-        if not tracks:
+            # REAL (ground-truth) dose centroids from the encoded treated cells, at
+            # the same doses/order — lets us score how clean the biology itself is
+            # and how well the prediction matches it (the key cherry-pick signals).
+            real_cents, n_per_dose = [], []
+            for d in track.doses:
+                idx = np.where(dmask & (rng4 == d))[0]
+                n_per_dose.append(int(len(idx)))
+                real_cents.append(
+                    latents[torch.from_numpy(idx)].float().mean(0).cpu().numpy()
+                )
+            real_cents = np.stack(real_cents, axis=0)
+            real_metrics = monotonicity_score(track.control_centroid, real_cents)
+            # predicted vs real shift agreement (per dose, then averaged)
+            c0 = track.control_centroid[None, :]
+            pshift, rshift = track.dose_centroids - c0, real_cents - c0
+            pn = np.linalg.norm(pshift, axis=1)
+            rn = np.linalg.norm(rshift, axis=1)
+            pred_real_cos = float(np.mean((pshift * rshift).sum(1) / (pn * rn + eps)))
+            gap_closed = float(np.mean(pn / (rn + eps)))  # >1 overshoot, <1 undershoot
+            # demo_score rewards combos where BOTH the real biology and the prediction
+            # are monotone+collinear AND the prediction points the right way.
+            demo_score = (
+                track.metrics["score"] * real_metrics["score"] * max(0.0, pred_real_cos)
+            )
+            track.metrics.update(
+                real_score=real_metrics["score"],
+                pred_real_cos=pred_real_cos,
+                demo_score=demo_score,
+            )
+            scored.append((demo_score, track))
+            all_rows.append({
+                "cell_line": str(line),
+                "drug": str(dname),
+                "n_doses": len(track.doses),
+                "doses_log10M": ";".join(f"{d:.3f}" for d in track.doses),
+                "cells_per_dose": ";".join(str(n) for n in n_per_dose),
+                "n_control": int(control_latents.shape[0]),
+                "pred_score": round(track.metrics["score"], 4),
+                "pred_collinearity": round(track.metrics["collinearity"], 4),
+                "pred_monotonicity": round(track.metrics["magnitude_monotonicity"], 4),
+                "real_score": round(real_metrics["score"], 4),
+                "real_collinearity": round(real_metrics["collinearity"], 4),
+                "real_monotonicity": round(real_metrics["magnitude_monotonicity"], 4),
+                "pred_real_cosine": round(pred_real_cos, 4),
+                "gap_closed": round(gap_closed, 4),
+                "demo_score": round(demo_score, 4),
+            })
+        if not scored:
             continue
-        tracks = rank_combos(tracks)
-        top = tracks[: int(cfg.viz.get("top_drugs", 5))]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [t for _, t in scored[: int(cfg.viz.get("top_drugs", 5))]]
         safe = str(line).replace("/", "_")
         prefix = os.path.join(out_dir, f"dose_shift_{safe}")
         paths = plot_dose_shift(
@@ -185,8 +236,45 @@ def run(config: str = "examples/tahoe_perturbator/cfgs/visualize.yaml", **overri
         best = top[0]
         logger.info(
             f"[{line}] {len(top)} drug tracks | best={best.drug} "
-            f"score={best.metrics['score']:.3f} -> {paths[0]}"
+            f"demo={best.metrics['demo_score']:.3f} "
+            f"(pred={best.metrics['score']:.2f} real={best.metrics['real_score']:.2f} "
+            f"cos={best.metrics['pred_real_cos']:.2f}) -> {paths[0]}"
         )
+
+    # --- cherry-pick ranking table over every (cell_line, drug) ----------------
+    if all_rows:
+        all_rows.sort(key=lambda r: r["demo_score"], reverse=True)
+        cols = list(all_rows[0].keys())
+        csv_path = os.path.join(out_dir, "dose_ranking.csv")
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(all_rows)
+        with open(os.path.join(out_dir, "dose_ranking.json"), "w") as f:
+            json.dump(all_rows, f, indent=2)
+        logger.info(f"wrote ranking table ({len(all_rows)} combos) -> {csv_path}")
+        logger.info("top cherry-pick combos (by demo_score):")
+        for r in all_rows[:15]:
+            logger.info(
+                f"  {r['cell_line']:>12} | {r['drug']:<22} "
+                f"demo={r['demo_score']:.3f} pred={r['pred_score']:.2f} "
+                f"real={r['real_score']:.2f} cos={r['pred_real_cosine']:.2f} "
+                f"gap={r['gap_closed']:.2f} ndose={r['n_doses']}"
+            )
+        if cfg.get("wandb") and cfg.wandb.get("enabled", False):
+            try:
+                import wandb
+
+                wandb.init(
+                    project=cfg.wandb.get("project", "hacktheworld"),
+                    entity=cfg.wandb.get("entity", "unaite"),
+                    name="perturbator_dose_ranking", job_type="viz",
+                )
+                tbl = wandb.Table(columns=cols, data=[[r[c] for c in cols] for r in all_rows])
+                wandb.log({"perturbator/dose_ranking": tbl})
+                wandb.finish()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"wandb table logging skipped: {e}")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,11 @@ loss:
   ode_steps: 20
   ode_method: heun
 
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
+
 viz:
   out_dir: visualizations/perturbator
   n_cells: 200000            # cells to stream/encode for the figure
