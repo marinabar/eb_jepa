@@ -148,12 +148,12 @@ The hard part. Two approaches:
 
 ## Dataset
 
-We use **Tahoe-100M** (`tahoebio/Tahoe-100M`): ~95.6M drug-perturbed single cells across **50 cancer cell lines**, **379 distinct drugs** (~1,100 drug×dose perturbations), vocabulary of **62,710 genes** (Ensembl release 109 / GRCh38). On the cluster it lives at `/data/tahoe-100m` (~429 GB parquet).
+We use **Tahoe-100M** (`tahoebio/Tahoe-100M`): ~95.6M drug-perturbed single cells across **50 cancer cell lines**, **379 distinct drugs** (~1,100 drug×dose perturbations), vocabulary of **62,710 genes** (Ensembl release 109 / GRCh38). On Dalia it lives at `/lustre/work/vivatech-unaite/shared/tahoe-100m` (~429 GB parquet).
 
 ### Tables (HuggingFace configs)
 
 - **`expression_data`** (main, ~95.6M rows, one per cell): `genes` (`list<int64>` gene token_ids), `expressions` (`list<float32>` raw UMI counts, aligned 1:1 with `genes`), `drug` (str; control = `"DMSO_TF"`), `sample` (str → `sample_metadata`), `cell_line_id` (str, Cellosaurus `CVCL_*` → `cell_line_metadata.Cell_ID_Cellosaur`), `moa-fine` (str), `canonical_smiles` (str), `pubchem_cid` (str), `plate` (str, `"plate1"`…`"plate14"`), `BARCODE_SUB_LIB_ID` (str → `obs_metadata`). The **first element of both `genes` and `expressions` is a CLS marker, stripped by position** (index 0); the remaining `expressions` are raw counts.
-- **`gene_metadata`** (62,710 rows): `token_id` (int64), `gene_symbol` (str), `ensembl_id` (str). The token_id ↔ ensembl_id map driving the ESMC/Evo2 embedding cache.
+- **`gene_metadata`** (62,710 rows): `token_id` (int64), `gene_symbol` (str), `ensembl_id` (str). The token_id ↔ ensembl_id map driving the ESMC/Evo2 embedding cache. **Gene `token_id`s span 3..62712** (62,710 distinct values); ids 0–2 are reserved special tokens — **CLS = token id 1** (its expression value is the sentinel `-2.0`). Any table indexed by raw `token_id` (count bins, gene-embedding lookups) must therefore have size **62713** (`max token_id + 1`), not 62710.
 - **`sample_metadata`** (PK `sample`): `plate`, `drug`, `drugname_drugconc`, mean QC stats. **`drugname_drugconc`** is the dose source — a string repr of a list of tuples, e.g. `"[('Infigratinib', 0.05, 'uM')]"` (control: `"[('DMSO_TF', 0.0, 'uM')]"`).
 - **`drug_metadata`** (379 rows, PK `drug`): `targets`, `moa-broad`, `moa-fine`, `human-approved`, `clinical-trials`, `canonical_smiles`, `pubchem_cid` (float64 here).
 - **`cell_line_metadata`** (one row per driver gene per line; 50 lines): `cell_name`, `Cell_ID_DepMap`, **`Cell_ID_Cellosaur`** (join key to `expression_data.cell_line_id`), **`Organ`** (e.g. `"Liver"`), driver-mutation fields.
@@ -166,7 +166,9 @@ Fixed transform: per-cell depth normalization (**CP10k**) then **log1p**, applie
 
 Value encoding is configurable between two benchmarked modes:
 - **(A) Continuous:** MLP projection of the log scalar + a learned mask vector.
-- **(B) Quantile binning:** per-gene quantile bins computed globally (~50 bins) + a dedicated `[MASK]` token. Global binning guarantees that a given `(gene, value)` maps to the **same bin across all drop/mask views**, keeping SIGReg stable.
+- **(B) Quantile binning:** per-gene quantile bins computed globally (default **64 bins**) + a dedicated `[MASK]` token. Global binning guarantees that a given `(gene, value)` maps to the **same bin across all drop/mask views**, keeping SIGReg stable.
+
+The mode-B bins are **precomputed and saved** on Dalia at `/lustre/work/vivatech-unaite/shared/tahoe-cache/`: `quantile_bins.npy` (`[62713, 63]` edges, indexed by raw `token_id`) + `quantile_bins.json`, the full streaming `gene_count_histogram.npy` (`[62713, 4096]`, so any `n_bins` can be re-derived without rescanning), and `quantile_stats.pt`. Fit over **all 95.6M cells** (139.6 B observations) via `eb_jepa.datasets.tahoe.normalizer.GeneHistogram`; 54,884 of 62,710 genes are ever expressed (unseen genes get all-zero edges → bin 0). Bin occupancy on the busiest genes is uniform to ±0.0001 of the ideal 1/64.
 
 ### Liver filtering
 
@@ -198,7 +200,7 @@ Store two frozen lookup tables (ESMC `[1280]`, Evo2 `[d_evo2]`) plus an index `(
 
 ### Preprocessing & cache (cluster)
 
-Prep pass over `/data/tahoe-100m`: stream → filter liver (specialize phase) → subsample → write to local NVMe (Arrow/Parquet or sparse memmap) each cell as `(gene_token_id, CP10k+log1p-normalized value)` — value **continuous and mode-agnostic**.
+Prep pass over `/lustre/work/vivatech-unaite/shared/tahoe-100m`: stream → filter liver (specialize phase) → subsample → write to local NVMe (Arrow/Parquet or sparse memmap) each cell as `(gene_token_id, CP10k+log1p-normalized value)` — value **continuous and mode-agnostic**.
 
 Normalization stats (per-gene quantile boundaries, pathway stats) are computed on the cached sample and stored separately; binning (mode B) or projection (mode A) is applied **at load time**, so we can change mode or K **without re-caching**.
 
@@ -235,6 +237,16 @@ The headline deliverable: **JEPA beats well-tuned MAE / VAE / PCA baselines on r
 - **Advanced / exploratory:** causal field theory for gene-knockout modeling in internal representations (use Lucas's transformer causal-field-theory code when available).
 - **Pedagogy:** large explanatory schematics of inputs and architecture for the hackathon deliverable.
 
+## Visualization design system
+
+Every figure must be **elegant** — publication-grade for the hackathon deliverable, never a default-matplotlib dump. **All visuals are saved to the repo's `visualizations/` folder** (the single canonical home); figures generated on the cluster are staged at `/lustre/work/vivatech-unaite/ljung/visualizations/` and synced into `visualizations/`.
+
+House style (apply consistently):
+- **Palette:** ink `#1d2433` (text/lines), muted `#7a8699` (subtitles/labels/ticks), accent `#2a6f97` (primary fill), grid `#e9edf2`; alternate accent `#3f8bb5`. Categorical colorings use a perceptually-even qualitative palette.
+- **Layout:** white background; top & right spines removed; thin `#c7cfdb` axes; light **x-only** grid; no y-ticks on density plots. Titles **bold, left-aligned** with a small grey one-line subtitle giving the key stat/context.
+- **Form:** gradient-filled densities (alpha fade to 0); `dpi≥200`; tight `bbox`; DejaVu Sans (or a cleaner serif when available). Provide **PDF/SVG** alongside PNG for anything entering the written deliverable.
+- **Honesty:** display-only smoothing (e.g. Gaussian over the count "comb" from discrete UMIs) is fine but must never alter the saved data; annotate sample sizes and what each cell/point represents.
+
 ## Benchmarks
 
 Use the single-cell **scib** library to compare against standard atlas representations.
@@ -244,6 +256,28 @@ Use the single-cell **scib** library to compare against standard atlas represent
 # Cluster access
 
 You'll get access to different GPU clusters per the instructions given. Always aim for **maximum GPU utilization** and sound memory usage.
+
+## Dalia (IDRIS) — the hackathon GB200 cluster
+
+The hackathon runs on **Dalia** at IDRIS (Hack The World(s) / Vivatech event). Access only works from the competition network.
+
+**Connect:** `ssh -i ~/.ssh/unaite_ljung ljung@dalia.idris.fr` (ed25519 key, user `ljung`). Login node is `dalia2`.
+
+**Architecture mismatch (critical):** the login node is **x86_64**, but the compute nodes are **aarch64** (Grace ARM) with **NVIDIA GB200** GPUs (sm_100, 198 GB HBM each). Binaries/venvs built on the login node fail on compute with "Exec format error". **Build the Python env *on* a compute node** via `srun`. Compute nodes have internet.
+
+**SLURM:** one partition `defq`, 18 nodes × 4 GB200 (72 GPUs). All nodes are held by an **ACTIVE reservation `Vivatech`** (account `vivatech`), so every job MUST pass `--reservation=Vivatech` or it sits PENDING with "ReqNodeNotAvail". Default `srun` gives 1 CPU — pass `--cpus-per-task=N`. `--pty` does **not** work over non-interactive SSH; omit it.
+
+```bash
+srun --reservation=Vivatech --partition=defq --gres=gpu:b200:4 \
+     --cpus-per-task=64 --time=HH:MM:SS \
+     /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python script.py
+```
+
+**Storage:** home `/lustre/home/extusers/ljung` is tiny (3 GB, tight **inode** quota — unpacking Python there blows the inode limit). Work dir `/lustre/work/vivatech-unaite/ljung` has 10 TB, no quota — put venvs, caches, and data there. The group `vivatech-unaite` is shared with teammates (mbarannik = Marina, lpahlawan, rsiahaang) and has a shared dir `/lustre/work/vivatech-unaite/shared`. Always redirect caches off home: export `XDG_CACHE_HOME`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `XDG_DATA_HOME`, `HF_HOME` under the work dir.
+
+**Prebuilt aarch64 env:** `/lustre/work/vivatech-unaite/ljung/venv-arm/bin/python` (torch 2.11.0+cu128, verified on a GB200). aarch64 `uv` is at `/lustre/work/vivatech-unaite/ljung/bin-arm/uv`.
+
+**Tahoe-100M data** lives at `/lustre/work/vivatech-unaite/shared/tahoe-100m` (downloaded from HF `tahoebio/Tahoe-100M`). The `/data/tahoe-100m` path mentioned elsewhere does **not** exist on Dalia.
 
 ---
 
