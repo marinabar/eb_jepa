@@ -201,6 +201,67 @@ def test_preprocess_liver_filter_e2e(tmp_path):
         assert set(t.column("cell_line_id").to_pylist()) <= {"CVCL_0001"}
 
 
+def test_fit_stats_e2e(tmp_path):
+    """fit_stats computes reusable stats over the dataset (no per-cell cache)."""
+    root, stats = tmp_path / "tahoe", tmp_path / "stats"
+    _write_tahoe_layout(root)
+    pp.fit_stats(
+        data_dir=str(root), out_dir=str(stats), n_bins=8, n_genes=200, val_frac=0.5
+    )
+    for fn in (
+        "maps.pt",
+        "split.pt",
+        "quantile_bins.npy",
+        "quantile_bins.json",
+        "gene_count_histogram.npy",
+        "quantile_stats.pt",
+    ):
+        assert (stats / fn).exists(), fn
+    assert not (stats / "train").exists()  # fit_stats writes no per-cell cache
+    st = torch.load(stats / "quantile_stats.pt")
+    assert st["cells_used"] > 0 and st["vocab"] == 200
+
+
+def test_run_reuses_stats(tmp_path):
+    """run(--stats_dir) reuses fit_stats output and skips recomputing the histogram."""
+    root, stats, cache = tmp_path / "tahoe", tmp_path / "stats", tmp_path / "cache"
+    _write_tahoe_layout(root)
+    pp.fit_stats(
+        data_dir=str(root), out_dir=str(stats), n_bins=8, n_genes=200, val_frac=0.5
+    )
+    pp.run(data_dir=str(root), out_dir=str(cache), stats_dir=str(stats), n_genes=200)
+    assert (cache / "train").exists() and (cache / "val").exists()
+    assert (cache / "quantile_bins.npy").exists() and (cache / "split.pt").exists()
+    # split is the one from fit_stats (copied, not recomputed)
+    assert (
+        torch.load(cache / "split.pt")["val_groups"]
+        == torch.load(stats / "split.pt")["val_groups"]
+    )
+    # reuse path does NOT recompute/save a histogram into the cache dir
+    assert not (cache / "gene_count_histogram.npy").exists()
+
+
+def test_shard_token_values_vectorized(tmp_path):
+    """The vectorized shard reader matches a naive per-cell CP10k+log1p + CLS strip."""
+    import pyarrow.parquet as pq
+
+    from eb_jepa.datasets.tahoe.normalizer import cp10k_log1p
+    from eb_jepa.datasets.tahoe.preprocess import _shard_token_values
+
+    _write_tahoe_layout(tmp_path / "t")
+    t = pq.read_table(
+        str(tmp_path / "t" / "data" / "train-0.parquet"),
+        columns=["genes", "expressions"],
+    )
+    tok, vals, n = _shard_token_values(t)
+    assert n == t.num_rows
+    g0 = t.column("genes")[0].as_py()[1:]  # naive CLS strip of first cell
+    e0 = t.column("expressions")[0].as_py()[1:]
+    assert list(tok[: len(g0)]) == g0
+    naive0 = cp10k_log1p(torch.tensor(e0).float())
+    assert torch.allclose(torch.from_numpy(vals[: len(g0)]), naive0, atol=1e-5)
+
+
 def test_fit_boundaries_from_cells():
     torch.manual_seed(0)
     cells = [

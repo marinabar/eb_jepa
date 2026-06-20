@@ -13,14 +13,25 @@ Runs once over ``/data/tahoe-100m`` to produce a training-ready cache:
      boundaries, and a small stats file are all saved separately so mode/K can
      change without re-caching (re-derive boundaries from the saved histogram).
 
-Pure helpers (maps, split, stats) are unit-tested; the streaming cache write is
-a cluster operation. Run on the GPU box (data at /data/tahoe-100m, use uv).
+Two entrypoints (the stats are computed ONCE and reused):
+  - ``fit_stats``: compute the per-gene quantile histogram/bins + the group split +
+    metadata maps over the WHOLE dataset, cache them to a stats dir. Vectorized; the
+    split groups come from the metadata tables (no expression scan to enumerate them).
+  - ``run``: write the per-split cache (CP10k+log1p ``value``, CLS stripped). With
+    ``--stats_dir <fit_stats out>`` it reuses the precomputed bins/split/maps and
+    skips the stats pass; otherwise it computes stats on the shards it writes.
+
+Pure helpers (maps, split, stats) are unit-tested; the streaming scans are cluster
+operations. Run on the GPU box (data at /data/tahoe-100m, use uv).
 
 Usage (cluster):
+    # 1. stats once over the whole dataset
+    python -m eb_jepa.datasets.tahoe.preprocess fit_stats \
+        --data_dir /data/tahoe-100m --out_dir /data/tahoe-stats --n_bins 64
+    # 2. build a (subset) training cache that reuses those stats
     python -m eb_jepa.datasets.tahoe.preprocess run \
         --data_dir /data/tahoe-100m --out_dir /data/tahoe-cache \
-        --liver_only False --val_frac 0.1 --split_by cell_line_id \
-        --n_bins 64 --quantile_cells 10000000
+        --stats_dir /data/tahoe-stats --max_shards 400
 """
 
 from __future__ import annotations
@@ -140,11 +151,191 @@ def fit_histogram_from_cells(
 
 
 # --------------------------------------------------------------------------- #
+# fit_stats: compute the histogram/bins + split ONCE over the whole dataset    #
+# --------------------------------------------------------------------------- #
+def _shard_token_values(table, keep_lines=None):
+    """Vectorized per-shard (token_ids int64, CP10k+log1p values float32, n_cells).
+
+    CLS marker stripped (first element of each cell). If ``keep_lines`` is given,
+    only cells whose ``cell_line_id`` is in it contribute. Fully numpy-vectorized
+    (no per-cell Python loop) so it can scan the whole dataset for the histogram.
+    """
+    import numpy as np
+
+    t = table.combine_chunks()
+    ga, ea = t.column("genes").chunk(0), t.column("expressions").chunk(0)
+    g_off = ga.offsets.to_numpy()
+    g_vals = ga.values.to_numpy(zero_copy_only=False)
+    e_vals = ea.values.to_numpy(zero_copy_only=False)
+    n = len(g_off) - 1
+    lengths = (g_off[1:] - g_off[:-1] - 1).clip(min=0)  # per-cell length post-CLS-strip
+    keep = np.ones(g_vals.shape[0], dtype=bool)
+    keep[g_off[:-1]] = False  # drop the CLS marker (first element of each cell)
+    if keep_lines is not None:
+        cl = t.column("cell_line_id").to_pylist()
+        row_keep = np.fromiter((c in keep_lines for c in cl), dtype=bool, count=n)
+        keep &= np.repeat(row_keep, g_off[1:] - g_off[:-1])
+        lengths = np.where(row_keep, lengths, 0)
+        n_cells = int(row_keep.sum())
+    else:
+        n_cells = n
+    tok = g_vals[keep].astype(np.int64)
+    raw = e_vals[keep].astype(np.float64)
+    cell_id = np.repeat(np.arange(n), lengths)
+    totals = np.zeros(n, dtype=np.float64)
+    np.add.at(totals, cell_id, raw)
+    np.maximum(totals, 1.0, out=totals)
+    vals = np.log1p(raw / totals[cell_id] * 1e4).astype(np.float32)
+    return tok, vals, n_cells
+
+
+def _derive_groups_from_metadata(
+    data_dir, split_by, cell_line_metadata, sample_metadata, drug_metadata
+):
+    """Unique split-group keys from a metadata table (no expression scan)."""
+    import pyarrow.parquet as pq
+
+    spec = {
+        "cell_line_id": (cell_line_metadata, "Cell_ID_Cellosaur"),
+        "sample": (sample_metadata, "sample"),
+        "drug": (drug_metadata, "drug"),
+    }.get(split_by)
+    if spec is None:
+        return None
+    path, col = spec
+    try:
+        f = _first_match(data_dir, path)
+    except FileNotFoundError:
+        return None
+    return [
+        v
+        for v in pq.read_table(f, columns=[col]).column(col).to_pylist()
+        if v is not None
+    ]
+
+
+def fit_stats(
+    data_dir: str = "/data/tahoe-100m",
+    out_dir: str = "/data/tahoe-stats",
+    expression_glob: str = "data/*.parquet",
+    cell_line_metadata: str = "metadata/cell_line_metadata.parquet",
+    sample_metadata: str = "metadata/sample_metadata.parquet",
+    gene_metadata: str = "metadata/gene_metadata.parquet",
+    drug_metadata: str = "metadata/drug_metadata.parquet",
+    liver_only: bool = False,
+    val_frac: float = 0.1,
+    split_by: str = "cell_line_id",
+    n_bins: int = 64,
+    n_genes: int = 62713,
+    quantile_cells: int = 0,  # 0 = use every scanned cell
+    n_hist_bins: int = 4096,
+    hist_v_min: float = 0.0,
+    hist_v_max: float = 10.0,
+    max_shards: int = 0,  # 0 = all shards; else an evenly-spread subset
+    seed: int = 0,
+):
+    """Compute, ONCE over the whole dataset, the reusable stats: per-gene quantile
+    histogram + bins, the group-level split, and the metadata maps. Writes them to
+    ``out_dir`` (no per-cell cache). ``run(--stats_dir out_dir)`` then reuses these
+    for any (subset) cache build without recomputing.
+
+    The histogram is fit fully vectorized over the scanned shards (all by default;
+    ``max_shards`` picks an evenly-spread subset — a multi-million-cell spread
+    sample yields per-gene quantiles statistically indistinguishable from the full
+    dataset). Split groups come from the metadata tables, so enumerating them needs
+    no expression scan. Saving the histogram lets bins for any ``n_bins`` be
+    re-derived later without re-scanning.
+    """
+    import pyarrow.parquet as pq
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    cl2organ = build_cell_line_to_organ(_first_match(data_dir, cell_line_metadata))
+    s2dose = build_sample_to_logconc(_first_match(data_dir, sample_metadata))
+    torch.save(
+        {"cell_line_to_organ": cl2organ, "sample_to_logconc": s2dose}, out / "maps.pt"
+    )
+    keep_lines = liver_cell_lines(cl2organ) if liver_only else None
+
+    try:
+        toks = (
+            pq.read_table(_first_match(data_dir, gene_metadata), columns=["token_id"])
+            .column("token_id")
+            .to_pylist()
+        )
+        vocab = max(toks) + 1
+    except FileNotFoundError:
+        vocab = n_genes
+
+    groups = _derive_groups_from_metadata(
+        data_dir, split_by, cell_line_metadata, sample_metadata, drug_metadata
+    )
+    if groups is None:
+        raise ValueError(
+            f"fit_stats cannot derive split groups for split_by={split_by!r}; "
+            "supported: cell_line_id, sample, drug."
+        )
+    if keep_lines is not None and split_by == "cell_line_id":
+        groups = [g for g in groups if g in keep_lines]
+    _train, val_groups = group_level_split(groups, val_frac, seed)
+    torch.save(
+        {"val_groups": sorted(val_groups), "split_by": split_by}, out / "split.pt"
+    )
+
+    files = sorted(glob.glob(os.path.join(data_dir, expression_glob), recursive=True))
+    if not files:
+        raise FileNotFoundError(
+            f"No expression parquet under {data_dir}/{expression_glob}"
+        )
+    if max_shards and max_shards < len(files):
+        stride = len(files) // max_shards
+        files = files[::stride][:max_shards]
+
+    read_cols = ["genes", "expressions"] + (
+        ["cell_line_id"] if keep_lines is not None else []
+    )
+    hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
+    cells_used, shards_used = 0, 0
+    for f in files:
+        t = pq.read_table(f, columns=read_cols)
+        tok, vals, n_cells = _shard_token_values(t, keep_lines)
+        if tok.size:
+            hist.update(torch.from_numpy(tok), torch.from_numpy(vals))
+        cells_used += n_cells
+        shards_used += 1
+        if quantile_cells > 0 and cells_used >= quantile_cells:
+            break
+
+    hist.binner(n_bins).save(out / "quantile_bins")
+    hist.save(out / "gene_count_histogram")
+    torch.save(
+        {
+            "cells_used": cells_used,
+            "shards_used": shards_used,
+            "vocab": vocab,
+            "n_bins": n_bins,
+            "n_hist_bins": n_hist_bins,
+            "hist_v_min": hist_v_min,
+            "hist_v_max": hist_v_max,
+            "split_by": split_by,
+            "liver_only": liver_only,
+        },
+        out / "quantile_stats.pt",
+    )
+    print(
+        f"fit_stats: {cells_used} cells / {shards_used} shards -> {out_dir} "
+        f"(n_bins={n_bins}, vocab={vocab}, val_groups={len(val_groups)})"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Streaming cache write (cluster)                                             #
 # --------------------------------------------------------------------------- #
 def run(
     data_dir: str = "/data/tahoe-100m",
     out_dir: str = "/data/tahoe-cache",
+    stats_dir: str = "",  # reuse fit_stats() output (bins+split+maps); skip stats pass
     expression_glob: str = "data/*.parquet",
     cell_line_metadata: str = "metadata/cell_line_metadata.parquet",
     sample_metadata: str = "metadata/sample_metadata.parquet",
@@ -182,99 +373,108 @@ def run(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    clm = _first_match(data_dir, cell_line_metadata)
-    smd = _first_match(data_dir, sample_metadata)
-    cl2organ = build_cell_line_to_organ(clm)
-    s2dose = build_sample_to_logconc(smd)
-    keep_lines = liver_cell_lines(cl2organ) if liver_only else None
-
-    torch.save(
-        {"cell_line_to_organ": cl2organ, "sample_to_logconc": s2dose}, out / "maps.pt"
-    )
-
-    # Index space = max token_id + 1 (Tahoe token_ids are non-contiguous, up to
-    # 62712; 0-2 are reserved). Derive it from gene_metadata so the per-gene
-    # histogram/binner never overflow; fall back to the n_genes arg if absent.
-    try:
-        gmd = _first_match(data_dir, gene_metadata)
-        tok = pq.read_table(gmd, columns=["token_id"]).column("token_id").to_pylist()
-        vocab = max(tok) + 1
-    except FileNotFoundError:
-        vocab = n_genes
-
     files = sorted(glob.glob(os.path.join(data_dir, expression_glob), recursive=True))
     if not files:
         raise FileNotFoundError(
             f"No expression parquet under {data_dir}/{expression_glob}"
         )
-    # For a tractable first cache, scan a subset of the (3388) shards spread evenly
-    # across the dataset (stride, not the first N) so all cell lines/drugs appear.
+    # Scan a subset of the (3388) shards spread evenly across the dataset (stride,
+    # not the first N) so all cell lines/drugs appear.
     if max_shards and max_shards < len(files):
         stride = len(files) // max_shards
         files = files[::stride][:max_shards]
 
-    # Spread the quantile sample across the whole dataset: keep each cell with
-    # probability ~quantile_cells/total so the stats are not biased to head shards.
-    # (Liver subsets are small, so keep all of them; quantile_cells<=0 also = all.)
-    total_rows = sum(pq.read_metadata(f).num_rows for f in files)
-    keep_p = (
-        1.0
-        if (liver_only or quantile_cells <= 0)
-        else min(1.0, quantile_cells / max(total_rows, 1))
-    )
-    rng = random.Random(seed)
+    if stats_dir:
+        # Reuse stats computed ONCE over the whole dataset by fit_stats(): the maps,
+        # the group split, and the quantile bins. Skip the histogram/group pass.
+        import shutil
 
-    # First pass: collect the group keys present (for the split) + fit the
-    # streaming per-gene histogram on the sampled cells.
-    hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
-    group_keys, q_used, kept = set(), 0, 0
-    # dedupe in case split_by == "cell_line_id" (a column can't be requested twice)
-    pass1_cols = list(dict.fromkeys(["genes", "expressions", split_by, "cell_line_id"]))
-    for f in files:
-        t = pq.read_table(f, columns=pass1_cols)
-        g_acc, v_acc = [], []
-        for i in range(t.num_rows):
-            cvcl = t.column("cell_line_id")[i].as_py()
-            if keep_lines is not None and cvcl not in keep_lines:
-                continue
-            group_keys.add(t.column(split_by)[i].as_py())
-            take = (quantile_cells <= 0 or q_used < quantile_cells) and (
-                keep_p >= 1.0 or rng.random() < keep_p
+        sd = Path(stats_dir)
+        cl2organ = torch.load(sd / "maps.pt")["cell_line_to_organ"]
+        keep_lines = liver_cell_lines(cl2organ) if liver_only else None
+        split = torch.load(sd / "split.pt")
+        val_groups, split_by = set(split["val_groups"]), split["split_by"]
+        for fn in ("maps.pt", "split.pt", "quantile_bins.npy", "quantile_bins.json"):
+            if (sd / fn).exists():
+                shutil.copy(sd / fn, out / fn)
+    else:
+        clm = _first_match(data_dir, cell_line_metadata)
+        smd = _first_match(data_dir, sample_metadata)
+        cl2organ = build_cell_line_to_organ(clm)
+        s2dose = build_sample_to_logconc(smd)
+        keep_lines = liver_cell_lines(cl2organ) if liver_only else None
+        torch.save(
+            {"cell_line_to_organ": cl2organ, "sample_to_logconc": s2dose},
+            out / "maps.pt",
+        )
+        # Index space = max token_id + 1 (token_ids non-contiguous, up to 62712).
+        try:
+            gmd = _first_match(data_dir, gene_metadata)
+            toks = (
+                pq.read_table(gmd, columns=["token_id"]).column("token_id").to_pylist()
             )
-            if take:
-                g = t.column("genes")[i].values.to_numpy(zero_copy_only=False)[1:]
-                e = t.column("expressions")[i].values.to_numpy(zero_copy_only=False)[1:]
-                g_acc.append(torch.from_numpy(g.astype("int64")))
-                v_acc.append(cp10k_log1p(torch.from_numpy(e.copy()).float()))
-                q_used += 1
-            kept += 1
+            vocab = max(toks) + 1
+        except FileNotFoundError:
+            vocab = n_genes
+        total_rows = sum(pq.read_metadata(f).num_rows for f in files)
+        keep_p = (
+            1.0
+            if (liver_only or quantile_cells <= 0)
+            else min(1.0, quantile_cells / max(total_rows, 1))
+        )
+        rng = random.Random(seed)
+        # First pass: collect group keys (split) + fit the streaming histogram.
+        hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
+        group_keys, q_used, kept = set(), 0, 0
+        # dedupe in case split_by == "cell_line_id" (can't request a column twice)
+        pass1_cols = list(
+            dict.fromkeys(["genes", "expressions", split_by, "cell_line_id"])
+        )
+        for f in files:
+            t = pq.read_table(f, columns=pass1_cols)
+            g_acc, v_acc = [], []
+            for i in range(t.num_rows):
+                cvcl = t.column("cell_line_id")[i].as_py()
+                if keep_lines is not None and cvcl not in keep_lines:
+                    continue
+                group_keys.add(t.column(split_by)[i].as_py())
+                take = (quantile_cells <= 0 or q_used < quantile_cells) and (
+                    keep_p >= 1.0 or rng.random() < keep_p
+                )
+                if take:
+                    g = t.column("genes")[i].values.to_numpy(zero_copy_only=False)[1:]
+                    e = t.column("expressions")[i].values.to_numpy(
+                        zero_copy_only=False
+                    )[1:]
+                    g_acc.append(torch.from_numpy(g.astype("int64")))
+                    v_acc.append(cp10k_log1p(torch.from_numpy(e.copy()).float()))
+                    q_used += 1
+                kept += 1
+                if subsample and kept >= subsample:
+                    break
+            if g_acc:
+                hist.update(torch.cat(g_acc), torch.cat(v_acc))
             if subsample and kept >= subsample:
                 break
-        if g_acc:
-            hist.update(torch.cat(g_acc), torch.cat(v_acc))
-        if subsample and kept >= subsample:
-            break
-
-    _train_groups, val_groups = group_level_split(group_keys, val_frac, seed)
-    binner = hist.binner(n_bins)
-    binner.save(out / "quantile_bins")  # [n_genes, n_bins-1] edges used by mode B
-    hist.save(out / "gene_count_histogram")  # re-derive boundaries for any n_bins
-    torch.save(
-        {
-            "quantile_cells_requested": quantile_cells,
-            "quantile_cells_used": q_used,
-            "keep_p": keep_p,
-            "total_rows": total_rows,
-            "n_bins": n_bins,
-            "n_hist_bins": n_hist_bins,
-            "hist_v_min": hist_v_min,
-            "hist_v_max": hist_v_max,
-        },
-        out / "quantile_stats.pt",
-    )
-    torch.save(
-        {"val_groups": sorted(val_groups), "split_by": split_by}, out / "split.pt"
-    )
+        _train_groups, val_groups = group_level_split(group_keys, val_frac, seed)
+        hist.binner(n_bins).save(out / "quantile_bins")
+        hist.save(out / "gene_count_histogram")
+        torch.save(
+            {
+                "quantile_cells_requested": quantile_cells,
+                "quantile_cells_used": q_used,
+                "keep_p": keep_p,
+                "total_rows": total_rows,
+                "n_bins": n_bins,
+                "n_hist_bins": n_hist_bins,
+                "hist_v_min": hist_v_min,
+                "hist_v_max": hist_v_max,
+            },
+            out / "quantile_stats.pt",
+        )
+        torch.save(
+            {"val_groups": sorted(val_groups), "split_by": split_by}, out / "split.pt"
+        )
 
     # Second pass: write per-split parquet shards (CP10k+log1p value, CLS stripped).
     writers = {}
@@ -364,4 +564,4 @@ def _first_match(data_dir: str, pattern: str) -> str:
 if __name__ == "__main__":
     import fire
 
-    fire.Fire({"run": run})
+    fire.Fire({"fit_stats": fit_stats, "run": run})
