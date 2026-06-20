@@ -711,6 +711,102 @@ def figure_programs_attention(path: str):
     return path
 
 
+# --------------------------------------------------------------------------- #
+# figure 9 — hierarchical clustering (analogs of DTW/HDBSCAN/Gompertz methods)
+# --------------------------------------------------------------------------- #
+def figure_hierarchy(path: str):
+    from scipy.cluster.hierarchy import cophenet, dendrogram, linkage
+    from scipy.spatial.distance import pdist
+    from scipy.optimize import curve_fit
+    from sklearn.cluster import HDBSCAN, KMeans
+
+    rng = np.random.default_rng(8)
+    fig, ax = plt.subplots(2, 2, figsize=(13.5, 10.5))
+    organ_color = {0: "#e6194B", 1: "#3cb44b", 2: "#4363d8"}
+
+    # organ -> cell line -> cells (a real two-level taxonomy)
+    organs, lines_per_organ, d = ["liver", "lung", "kidney"], 4, 12
+    organ_dirs = 6 * rng.standard_normal((3, d))
+    centroids, cl_names, cl_organ, Xcells, cell_organ = [], [], [], [], []
+    for oi, o in enumerate(organs):
+        for li in range(lines_per_organ):
+            c = organ_dirs[oi] + 1.4 * rng.standard_normal(d)      # line near its organ
+            centroids.append(c); cl_names.append(f"{o[:2].upper()}{li}"); cl_organ.append(oi)
+            Xcells.append(c + 0.6 * rng.standard_normal((40, d))); cell_organ += [oi] * 40
+    centroids = np.array(centroids); Xcells = np.concatenate(Xcells)
+    name_organ = {cl_names[i]: cl_organ[i] for i in range(len(cl_names))}
+
+    # A. Ward dendrogram of cell-line centroids — do lines nest within organ?
+    Z = linkage(centroids, method="ward")
+    coph, _ = cophenet(Z, pdist(centroids))
+    dendrogram(Z, labels=cl_names, ax=ax[0, 0], leaf_font_size=9)
+    for lbl in ax[0, 0].get_xticklabels():
+        lbl.set_color(organ_color[name_organ[lbl.get_text()]])
+    ax[0, 0].set_title(f"A. Biological hierarchy: cell lines nest within organ "
+                       f"(Ward; cophenetic r={coph:.2f})", fontsize=10)
+    ax[0, 0].set_ylabel("merge distance")
+
+    # B. HDBSCAN density clusters on the latent (no k; flags outliers)
+    xy = viz.embed_2d(Xcells, method="pca", seed=0)
+    lab = HDBSCAN(min_cluster_size=25).fit_predict(Xcells)
+    n_found = len(set(lab)) - (1 if -1 in lab else 0)
+    noise = lab == -1
+    ax[0, 1].scatter(*xy[noise].T, s=6, c="0.75", alpha=0.5, label="outliers")
+    ax[0, 1].scatter(*xy[~noise].T, s=8, c=lab[~noise], cmap="tab20", alpha=0.7)
+    ax[0, 1].legend(fontsize=8)
+    ax[0, 1].set_title(f"B. HDBSCAN density clusters (no k): {n_found} found, grey = outliers",
+                       fontsize=10)
+    ax[0, 1].set_xticks([]); ax[0, 1].set_yticks([])
+
+    # C. perturbation hierarchy: drugs cluster by MoA (cosine dendrogram)
+    Xp, drug, dose, _, drug_moa, _ = make_perturbation_latents(rng=np.random.default_rng(0))
+    deltas, names, c0 = viz.displacement_vectors(Xp, drug, CTRL)
+    Zc = linkage(deltas, method="average", metric="cosine")
+    dn = dendrogram(Zc, labels=names, ax=ax[1, 0], leaf_font_size=6)
+    for lbl in ax[1, 0].get_xticklabels():
+        lbl.set_color(MOA_COLORS[drug_moa[lbl.get_text()]])
+    ax[1, 0].set_title("C. Perturbation hierarchy: drugs cluster by MoA (cosine dendrogram)",
+                       fontsize=10)
+    ax[1, 0].set_ylabel("cosine distance")
+
+    # D. Hill dose-response params (Emax, EC50) -> potent vs mild responders
+    doses = np.array([0.1, 0.25, 0.4, 0.6, 0.8, 1.0])
+
+    def hill(x, emax, ec50, h):
+        return emax * x**h / (ec50**h + x**h)
+
+    # heterogeneous drugs: ~half potent (high Emax, low EC50), ~half mild
+    n_d = 18
+    true_emax = np.concatenate([rng.uniform(4.5, 6.0, n_d // 2), rng.uniform(1.0, 2.5, n_d // 2)])
+    true_ec50 = np.concatenate([rng.uniform(0.15, 0.30, n_d // 2), rng.uniform(0.45, 0.75, n_d // 2)])
+    params = []
+    for i in range(n_d):
+        mags = hill(doses, true_emax[i], true_ec50[i], 2.5) + rng.normal(0, 0.12, len(doses))
+        try:
+            p, _ = curve_fit(hill, doses, np.clip(mags, 0, None), p0=[max(mags), 0.4, 2.0],
+                             bounds=([0, 0.05, 0.5], [20, 2.0, 6.0]), maxfev=10000)
+        except Exception:
+            p = [max(mags), 0.5, 2.0]
+        params.append([p[0], p[1]])
+    params = np.array(params)
+    km = KMeans(2, n_init=10, random_state=0).fit_predict(params)
+    order = sorted(set(km), key=lambda c: -params[km == c, 0].mean())  # high-Emax cluster first
+    labels2 = {order[0]: "potent (high Emax)", order[1]: "milder"}
+    for c in order:
+        m = km == c
+        ax[1, 1].scatter(params[m, 1], params[m, 0], s=40, label=labels2[c])
+    ax[1, 1].legend(fontsize=8)
+    ax[1, 1].set_title("D. Dose-response S-curve params (Emax, EC50): potent vs mild responders",
+                       fontsize=10)
+    ax[1, 1].set_xlabel("EC50 (potency)"); ax[1, 1].set_ylabel("Emax (max effect / ceiling)")
+
+    fig.suptitle("Hierarchical clustering — analogs of HDBSCAN / cosine-dendrogram / "
+                 "Hill(Gompertz)-param clustering — SYNTHETIC illustrative data", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(path, dpi=130, bbox_inches="tight"); plt.close(fig)
+    return path
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     figs = [
@@ -722,6 +818,7 @@ def main():
         (figure_alignment, "representation_alignment.png"),
         (figure_latent_structure, "latent_structure.png"),
         (figure_programs_attention, "programs_attention.png"),
+        (figure_hierarchy, "hierarchical_clustering.png"),
     ]
     for fn, name in figs:
         print("wrote:", fn(os.path.join(OUT, name)))

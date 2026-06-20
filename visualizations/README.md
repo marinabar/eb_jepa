@@ -21,6 +21,7 @@ by `eb_jepa/singlecell/viz_demo.py` and re-created cell-by-cell in
 | `representation_alignment.png` | Procrustes JEPA↔DepMap, representational-convergence matrix, layer-wise CKA, latent arithmetic transfer |
 | `latent_structure.png` | intrinsic dimension (TwoNN) vs encoder width, embedding trustworthiness, latent density KDE, kNN graph by organ |
 | `programs_attention.png` | gene programs along the control→toxic geodesic, attention→TRRUST ROC, attention recovers regulons, per-dim ~N(0,1) |
+| `hierarchical_clustering.png` | organ→cell-line Ward dendrogram (cophenetic r), HDBSCAN density clusters, MoA cosine dendrogram, Hill dose-response params (potent vs mild) |
 
 External ground truth used by the alignment/attention panels: **TRRUST** (signed
 TF→target regulatory graph) and **DepMap** (cell-line metadata, gene dependency,
