@@ -193,10 +193,10 @@ Cells are **sparse**: `genes` = token_ids of non-zero genes, `expressions` = ali
 ### Gene-embedding cache (ESMC + Evo2)
 
 Built **once, offline on the cluster**, keyed by `token_id → ensembl_id` (from `gene_metadata`, release 109/GRCh38). Per gene: resolve the canonical transcript (Ensembl REST, pinned to release 109), its biotype (`protein_coding` → coding), the canonical protein sequence (coding only) and the canonical transcript DNA (all genes). Then:
-- **ESMC** (`esmc-600m`, 1280-dim per residue): mean-pool over residues → one vector per coding gene. Non-coding genes get no protein term.
-- **Evo2** (`arcinstitute/evo2-*`; `d_evo2` read from the model config, not hardcoded): run the DNA sequence, extract the **layer + pooling chosen by a small validation sweep** (not assumed), → one vector per gene.
+- **ESMC** (`esmc-600m`, **1152-dim** per residue): mean-pool over residues → one vector per coding gene. Non-coding genes get no protein term.
+- **Evo2** (`arcinstitute/evo2_7b_base`, **d_evo2 = 4096**): run the DNA sequence and extract **layer 24, mean-pooled** → one vector per gene.
 
-Store two frozen lookup tables (ESMC `[1280]`, Evo2 `[d_evo2]`) plus an index `(token_id, ensembl_id, is_coding, esmc_offset, evo2_offset)` (~15-20 GB total). The encoder learns `Linear(1280→d_model)` and `Linear(d_evo2→d_model)` over these frozen vectors and sums with the count embedding. **Validate** before trusting the cache: confirm `genes`/`expressions` are 1:1 aligned and the first element is always the CLS marker on a sample of real rows.
+Store two frozen lookup tables — `esmc.npy` `[n_coding=20063, 1152]` (coding genes only) and `evo2.npy` `[n_genes=62710, 4096]` (all genes) — plus `index.parquet` `(token_id, ensembl_id, is_coding, esmc_row, evo2_row)` and `metadata.json` (~1.1 GB total). The encoder learns `Linear(1152→d_model)` and `Linear(4096→d_model)` over these frozen vectors and sums with the count embedding; `GeneTokenEmbedding.from_cache` sizes the lookup tables to `max(token_id)+1 = 62713` so they are indexed directly by raw token_id. The cache is **fetched once** with `python scripts/fetch_gene_embeddings.py --out <dir>` (public MinIO, no creds) and lives on Dalia at `/lustre/work/vivatech-unaite/shared/gene_emb_cache`. **Validate** before trusting it: confirm `genes`/`expressions` are 1:1 aligned and the first element is always the CLS marker on a sample of real rows. (61,428 of 62,710 genes have a nonzero Evo2 vector; the rest had no usable transcript sequence and fall back to count-only.)
 
 ### Preprocessing & cache (cluster)
 
