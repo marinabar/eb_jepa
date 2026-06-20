@@ -183,7 +183,9 @@ def train(cfg, device=None):
         lr=cfg.optim.lr,
         betas=tuple(cfg.optim.get("betas", (0.9, 0.95))),
     )
-    total_steps = cfg.optim.epochs * max(1, len(train_loader))
+    max_steps = int(cfg.optim.get("max_steps", 0))
+    # size the LR schedule to the actual run length (max_steps caps it)
+    total_steps = max_steps if max_steps > 0 else cfg.optim.epochs * max(1, len(train_loader))
     sched = CosineWithWarmup(
         opt,
         total_steps,
@@ -214,7 +216,6 @@ def train(cfg, device=None):
         )
         logger.info(f"t-SNE snapshot @ step {step} -> {path}")
 
-    max_steps = int(cfg.optim.get("max_steps", 0))
     tsne_every = int(cfg.get("eval", {}).get("tsne_every", 0)) if do_tsne else 0
     if do_tsne:
         _snapshot(0)  # baseline (random init)
