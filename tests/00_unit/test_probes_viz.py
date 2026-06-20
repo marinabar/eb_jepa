@@ -83,6 +83,21 @@ class TestProbes:
         results = run_probe_suite(feats, meta)
         assert "clf/organ" in results and "reg/gene_count" in results
 
+    def test_suite_new_targets(self):
+        feats, _ = _separable(n_per=30, n_classes=2)  # 60 cells
+        n = feats.shape[0]
+        meta = {
+            "drug": ["DMSO_TF" if i % 2 else "DrugX" for i in range(n)],
+            "driver_gene": ["TP53" if i % 2 else "KRAS" for i in range(n)],
+            "driver_type": ["oncogene" if i % 2 else "suppressor" for i in range(n)],
+            "pathway/HALLMARK_APOPTOSIS": [float(i) for i in range(n)],
+        }
+        res = run_probe_suite(feats, meta)
+        # DMSO-only (derived), driver mutation/type, and HALLMARK pathway regression
+        assert "clf/is_dmso" in res and "clf/driver_gene" in res
+        assert "clf/driver_type" in res
+        assert "reg/pathway/HALLMARK_APOPTOSIS" in res
+
 
 def _eval_cells(n=40):
     cells = []

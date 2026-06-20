@@ -168,12 +168,31 @@ def run_probe_suite(
     training-budget to cap.
     """
     del epochs  # no longer used (probes are not iterative)
+    # DMSO-only (control) vs treated, derived from the drug label
+    if "drug" in meta and "is_dmso" not in meta:
+        meta = {
+            **meta,
+            "is_dmso": ["DMSO" if d == "DMSO_TF" else "treated" for d in meta["drug"]],
+        }
     results = {}
-    for key in ("organ", "cell_line_id", "drug", "sample", "moa_fine"):
-        if key in meta and len(set(meta[key])) >= 2:
+    clf_keys = (
+        "organ",
+        "cell_line_id",
+        "drug",
+        "sample",
+        "moa_fine",
+        "driver_gene",  # cell-line driver mutation
+        "driver_mech",  # driver mechanism
+        "driver_type",  # oncogene vs tumour-suppressor
+        "is_dmso",  # control vs treated
+    )
+    for key in clf_keys:
+        if key in meta and len({x for x in meta[key] if x is not None}) >= 2:
             results[f"clf/{key}"] = train_classification_probe(features, meta[key])
-    if "gene_count" in meta:
-        results["reg/gene_count"] = train_regression_probe(
-            features, torch.tensor(meta["gene_count"])
-        )
+    # gene-count + any pathway/<name> regression targets (e.g. HALLMARK scores)
+    for key, target in meta.items():
+        if key == "gene_count" or key.startswith("pathway/"):
+            results[f"reg/{key}"] = train_regression_probe(
+                features, torch.as_tensor(target, dtype=torch.float32)
+            )
     return results
