@@ -1,0 +1,91 @@
+# Subliminal 1.4 (faithful port) on Tahoe-100M — Dalia, multi-GPU GB200.
+#
+# Reproduces the tuned cell-LeJEPA recipe: protein-coding-gene vocabulary,
+# frozen DNA(Evo2)+protein(ESMC) gene identity, per-cell quantile thermometer
+# counts, sigmoid-gated attention, pairwise-cosine JEPA + SIGReg, Muon+AdamW,
+# NO LR scheduler. The ONLY change from the 1.4 reference is model scale
+# (d=768/12L/12h vs 512/6L/8h).
+#
+# Launch (4x GB200 single node):
+#   torchrun --nproc_per_node=4 -m examples.tahoe_jepa.sub14_main run \
+#       --config examples/tahoe_jepa/cfgs/sub14.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/sub14
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/shared/tahoe-100m/data
+  split: train
+  streaming: true
+  shuffle_buffer: 16384
+  batch_size: 32            # per-GPU
+  num_workers: 6
+  pin_mem: true
+  max_cells: 0
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  # --- Subliminal 1.4 view construction ---
+  num_bins: 16              # per-cell equal-frequency quantile bins (thermometer)
+  genes_per_bin: 32         # max_genes_per_cell = num_bins * genes_per_bin = 512
+  n_views: 4                # JEPA views per cell (1.4 winner = 4)
+  binomial_subsample:
+    enabled: true
+    p_min: 0.5
+    p_max: 0.9
+
+model:
+  # Scaled up from 1.4's 512/6/8 (the one allowed deviation).
+  d_model: 768
+  n_heads: 12
+  n_layers: 12
+  d_ff: 3072               # 4 * d_model (1.4 used 4x: 512 -> 2048)
+  dropout: 0.1
+  proj_dim: 128            # JEPA/SIGReg latent
+  attention_activation: sigmoid   # sigmoid | softmax (1.4 winner = sigmoid)
+  freeze_features: true
+  grad_checkpoint: true
+  compile: false                  # Dalia/sm_100: matches dalia_full/collapse (no compile)
+  # eb_jepa frozen ESMC(protein)+Evo2(DNA) cache, filtered to protein-coding.
+  # Set to "random" for a smoke run without the real cache.
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+
+loss:
+  sigreg_weight: 0.4        # 1.4 tuned (loss = jepa + sigreg_weight * sigreg)
+  jepa_loss: cosine         # cosine (1 - cos_sim) | mse
+  sigreg_slices: 256
+  sigreg_knots: 17
+  sigreg_t_max: 3.0
+
+optim:
+  # Muon (2-D body) + AdamW (embeddings/norms/scalars). NO LR scheduler.
+  muon_lr: 2.0e-4
+  muon_weight_decay: 0.1
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  adamw_lr: 2.0e-4
+  adamw_weight_decay: 0.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 1.0e-8
+  epochs: 100
+  max_steps: 0              # no step cap; runs until max_minutes / epochs
+  max_grad_norm: 1.0
+
+training:
+  native_bf16: true         # bf16 throughout (1.4); set false for fp32/CPU smoke
+  log_every: 25
+  ckpt_every_steps: 1000
+  max_minutes: 600          # wall-clock backstop (final checkpoint always saved)
+
+eval:
+  enabled: true
+  eval_every: 500
+  eval_cells: 3000
+  encode_chunk: 256
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

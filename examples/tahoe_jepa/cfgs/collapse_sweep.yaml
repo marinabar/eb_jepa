@@ -1,0 +1,87 @@
+# Collapse / lambda sweep — PURE LeJEPA (Dalia, 4x GB200 single node).
+#
+# Goal: find the lambda that balances invariance vs SIGReg so the representation
+# neither collapses (low effective_rank, invariance dominates) nor over-regularizes
+# (SIGRet dominates). The loss is ONLY inv + SIGReg — no repr_var/cov, no embed_norm,
+# no proj_norm override (the projector keeps its spec BatchNorm). The launcher
+# (scripts/dalia_collapse_sweep.sh) overrides loss.lamb per run and, for the pathway
+# run, sets data.use_pathways + model.n_pathways. Everything else is FIXED across the
+# sweep so lambda is the only varied axis (shared seed=0 held-out eval set).
+#
+# Key knobs the sweep deliberately pins: lr=1e-4 (low, to study the lambda/lr/batch
+# interaction at the requested ceiling) and global batch 256 (better SIGReg ECF).
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/collapse/base
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset   # 16 spread-out shards
+  split: train
+  L: 2048
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: B
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 256           # single-GPU global batch (sbatch overrides via BS=256);
+                            # group GPU cap is 3 -> 1 GPU/run, large batch -> good SIGReg
+  num_workers: 8
+  pin_mem: true
+  quantile_bins: /lustre/work/vivatech-unaite/shared/tahoe-cache/quantile_bins
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  # pathway run only (set by the launcher): use_pathways / pathway_membership
+  use_pathways: false
+  pathway_membership: /lustre/work/vivatech-unaite/ljung/eb_jepa-cache/pathway_membership.pt
+  pathway_drop_frac: 0.5
+
+model:
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  n_kv_heads: 2
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 1024
+  proj_dim: 128
+  grad_checkpoint: true
+  compile: false
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+  n_pathways: 0             # pathway run only: launcher sets 50
+
+loss:
+  lamb: 0.02                # OVERRIDDEN per run (0.001 .. 0.5)
+  num_slices: 1024
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100
+  max_steps: 6000           # sizes the LR cosine; capped by max_minutes
+  lr: 1.0e-4                # low ceiling (requested) — study lambda/lr/batch interaction
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+eval:
+  enabled: true
+  eval_every: 250           # within-run collapse curve (effective_rank + probes)
+  eval_cells: 2000          # shared held-out probe set (seed=0 -> identical per run)
+  loss_cells: 256           # V-view batch for the held-out LeJEPA eval loss
+  classes: [organ, cell_line_id, drug, moa_fine]
+  encode_chunk: 128
+  perplexity: 30.0
+
+training:
+  amp: true
+  log_every: 25
+  ckpt_every_epoch: false
+  max_minutes: 110          # < SBATCH --time=02:00:00; final eval always saved
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

@@ -21,13 +21,18 @@ _CLASSES = ("organ", "cell_line_id", "drug", "moa_fine")
 
 
 @torch.no_grad()
-def build_eval_set(dataset, data_cfg, n_cells: int = 0, seed: int = 0, idx=None):
+def build_eval_set(
+    dataset, data_cfg, n_cells: int = 0, seed: int = 0, idx=None, membership=None
+):
     """Return (eval_batch, labels) for a FIXED set of cells (one clean full-gene
     view each, no drop/mask).
 
     If ``idx`` is given, use exactly those cell indices (the held-out probe set,
     excluded from SSL training); otherwise sample ``n_cells`` (seeded). ``labels``
-    maps each probe class (+ ``sample``) to its per-cell values.
+    maps each probe class (+ ``sample``) to its per-cell values. When the run uses
+    pathway tokens, ``membership`` is required and the eval batch keeps ALL pathway
+    tokens (drop_frac=0) so the probe/t-SNE representation matches the trained
+    forward path (a single deterministic full-cell view).
     """
     if idx is not None:
         items = [dataset[i] for i in idx]
@@ -44,9 +49,19 @@ def build_eval_set(dataset, data_cfg, n_cells: int = 0, seed: int = 0, idx=None)
     ecfg.view_mode = "drop"
     ecfg.gene_keep_frac = 1.0  # keep every gene (capped at L)
     ecfg.gene_mask_frac = 0.0
-    eval_batch = TahoeCollator(ecfg)(items)
+    ecfg.pathway_drop_frac = 0.0  # deterministic eval: every pathway token present
+    eval_batch = TahoeCollator(ecfg, membership=membership)(items)
     labels = {c: [it.get(c) for it in items] for c in _CLASSES + ("sample",)}
     return eval_batch, labels
+
+
+def _eval_pathways(eval_batch: dict, sl, device):
+    """Slice the single-view pathway tensors for an encode chunk (or None)."""
+    pc = eval_batch.get("pathway_count")
+    pm = eval_batch.get("pathway_mask")
+    if pc is None:
+        return None, None
+    return pc[0][sl].to(device), pm[0][sl].to(device)
 
 
 @torch.no_grad()
@@ -63,12 +78,15 @@ def encode_eval(encoder, eval_batch: dict, device, chunk: int = 128, amp: bool =
     reps = []
     for s in range(0, ids.shape[0], chunk):
         sl = slice(s, s + chunk)
+        pc, pm = _eval_pathways(eval_batch, sl, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             z = encoder(
                 ids[sl].to(device),
                 pad[sl].to(device),
                 count_value=cv[sl].to(device) if cv is not None else None,
                 count_bin=cb[sl].to(device) if cb is not None else None,
+                pathway_count=pc,
+                pathway_mask=pm,
             )
         reps.append(z.float().cpu())
     if was_training:
@@ -157,12 +175,15 @@ def tsne_snapshot(
     n = ids.shape[0]
     for s in range(0, n, chunk):
         sl = slice(s, s + chunk)
+        pc, pm = _eval_pathways(eval_batch, sl, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             z = encoder(
                 ids[sl].to(device),
                 pad[sl].to(device),
                 count_value=cv[sl].to(device) if cv is not None else None,
                 count_bin=cb[sl].to(device) if cb is not None else None,
+                pathway_count=pc,
+                pathway_mask=pm,
             )
         reps.append(z.float().cpu())
     reps = torch.cat(reps)

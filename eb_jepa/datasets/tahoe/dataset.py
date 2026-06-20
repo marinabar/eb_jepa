@@ -56,6 +56,11 @@ class TahoeConfig:
     # counts
     count_mode: str = "A"  # "A" continuous | "B" quantile bins
     n_bins: int = 64  # mode B
+    # pathway tokens (CLAUDE.md "Pathways"): P hallmark tokens appended per view,
+    # each = learned identity + hallmark count, dropped per view with prob drop_frac.
+    use_pathways: bool = False
+    pathway_membership: str = ""  # path to a saved {"M":[P,n_genes],"names":[...]} .pt
+    pathway_drop_frac: float = 0.5  # per-pathway dropout probability per view
     n_genes: int = (
         62713  # index space = max Tahoe token_id (62712) + 1 (densify/binning)
     )
@@ -118,6 +123,11 @@ def _make_item(genes, vals, cached, meta, binner, cell_line_to_organ, sample_to_
     item = {
         "gene_token_ids": token_ids,
         "values": values,
+        # Raw integer UMI counts (pre-normalization), kept for binomial-count
+        # subsampling (Subliminal-1.4-style views). For preprocessed caches the
+        # raw counts are gone, so fall back to the normalized values (binomial
+        # subsample on a cache is then a no-op / rank-preserving best effort).
+        "raw_counts": v if not cached else values,
         "drug": meta.get("drug"),
         "sample": sample,
         "cell_line_id": cell_line_id,
@@ -327,10 +337,18 @@ class TahoeCollator:
     count is hidden (mask-mode); the encoder substitutes a learned MASK there.
     """
 
-    def __init__(self, config: TahoeConfig):
+    def __init__(self, config: TahoeConfig, membership: torch.Tensor | None = None):
         self.cfg = config
         assert config.view_mode in ("drop", "mask")
         assert config.count_mode in ("A", "B")
+        # membership: [P, n_genes] float hallmark-weight matrix (row p, col token_id).
+        # A cell's pathway counts = membership @ dense(cell counts). Required iff
+        # use_pathways; the count is from the FULL cell (a cell property), and per-view
+        # corruption is the dropout of the pathway TOKEN, not a recomputed count.
+        self.membership = membership
+        if config.use_pathways:
+            assert membership is not None, "use_pathways requires a membership matrix"
+            self.n_pathways = membership.shape[0]
 
     def __call__(self, batch: list[dict]) -> dict:
         cfg = self.cfg
@@ -393,6 +411,26 @@ class TahoeCollator:
             out["count_bin"] = bins
         else:
             out["count_value"] = values
+
+        if cfg.use_pathways:
+            # Pathway count per cell = membership @ dense(full-cell normalized counts).
+            # Densify each cell's sparse (token_id -> value) into [n_genes], stack, and
+            # project onto the [P, n_genes] hallmark matrix -> [N, P]. The count uses the
+            # whole cell (not the view subset) and is shared across views; only the
+            # token's presence is corrupted per view.
+            dense = torch.zeros((n, cfg.n_genes), dtype=torch.float32)
+            for j, cell in enumerate(batch):
+                tok = cell["gene_token_ids"]
+                if tok.numel():
+                    dense[j, tok.long()] = cell["values"].float()
+            pcount = dense @ self.membership.T  # [N, P]
+            p = pcount.shape[1]
+            # broadcast the per-cell count to V views; per-(view,cell,pathway) dropout
+            pathway_count = pcount.unsqueeze(0).expand(v, n, p).contiguous()
+            keep_prob = 1.0 - cfg.pathway_drop_frac
+            pathway_mask = torch.rand((v, n, p)) < keep_prob  # True = token present
+            out["pathway_count"] = pathway_count
+            out["pathway_mask"] = pathway_mask
         return out
 
 
@@ -421,7 +459,16 @@ def init_tahoe_data(
     The ``collate_fn`` generates the LeJEPA views on the fly.
     """
     cfg = config
-    collator = TahoeCollator(cfg)
+    membership = None
+    if cfg.use_pathways:
+        if not cfg.pathway_membership:
+            raise ValueError("use_pathways=True requires data.pathway_membership path")
+        payload = torch.load(cfg.pathway_membership)
+        membership = payload["M"].float()
+        assert membership.shape[1] == cfg.n_genes, (
+            f"membership n_genes {membership.shape[1]} != cfg.n_genes {cfg.n_genes}"
+        )
+    collator = TahoeCollator(cfg, membership=membership)
     if getattr(cfg, "streaming", False):
         dataset = TahoeIterableDataset(
             cfg, binner, cell_line_to_organ, sample_to_logconc,

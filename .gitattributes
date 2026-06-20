@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.sbatch text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.npy binary
+*.pt binary
+*.parquet binary

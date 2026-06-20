@@ -95,6 +95,7 @@ def build_train_module(cfg) -> TrainModule:
         use_cls=cfg.model.use_cls,
         readout=cfg.model.readout,
         grad_checkpoint=cfg.model.get("grad_checkpoint", False),
+        n_pathways=cfg.model.get("n_pathways", 0),
     )
     projector = Projector(
         f"{cfg.model.d_model}-{cfg.model.proj_hidden}-{cfg.model.proj_dim}",
@@ -197,7 +198,8 @@ def train(cfg, device=None):
             from examples.tahoe_jepa.eval_tsne import build_eval_set
 
             eval_batch, eval_labels = build_eval_set(
-                dataset, data_cfg, n_eval, seed=cfg.meta.seed
+                dataset, data_cfg, n_eval, seed=cfg.meta.seed,
+                membership=collator.membership,
             )
             eval_dir = os.path.join(cfg.meta.run_dir, "eval")
             logger.info(f"streaming eval set: {n_eval} cells -> {eval_dir}")
@@ -236,17 +238,23 @@ def train(cfg, device=None):
         # V-view held-out batch for the eval LeJEPA loss — built on ALL ranks, because
         # the loss's SIGReg all-reduces across ranks; a rank-0-only eval-loss would
         # deadlock (other ranks sit at the barrier, never joining the collective).
+        # Each rank takes a DISJOINT shard of the (seeded, rank-identical) held-out
+        # set so the all-reduced SIGReg sees a true global batch of loss_cells*world
+        # distinct cells, not the same loss_cells replicated across ranks.
         if eval_enabled and n_eval > 0:
-            n_loss = min(int(cfg.eval.get("loss_cells", 128)), len(eval_idx))
+            loss_shard = eval_idx[rank::world]
+            n_loss = min(int(cfg.eval.get("loss_cells", 128)), len(loss_shard))
             eval_loss_batch = move_batch(
-                collator([dataset[i] for i in eval_idx[:n_loss]]), device
+                collator([dataset[i] for i in loss_shard[:n_loss]]), device
             )
 
         do_eval = is_main(rank) and eval_enabled and n_eval > 0
         if do_eval:  # rank 0 owns the probe + t-SNE eval set
             from examples.tahoe_jepa.eval_tsne import build_eval_set
 
-            eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
+            eval_batch, eval_labels = build_eval_set(
+                dataset, data_cfg, idx=eval_idx, membership=collator.membership
+            )
             eval_dir = os.path.join(cfg.meta.run_dir, "eval")
             logger.info(
                 f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
@@ -280,6 +288,30 @@ def train(cfg, device=None):
         warmup_ratio=cfg.optim.get("warmup_ratio", 0.05),
         min_lr=cfg.optim.get("min_lr", 1e-6),
     )
+
+    # Optional resume / warm-start from a full checkpoint (ckpt_latest.pt). With
+    # resume_optim=True the optimizer+scheduler+step are restored (exact continuation);
+    # with resume_optim=False only the weights load and a FRESH schedule starts from
+    # step 0 — i.e. reuse the checkpoint under any new learning-rate init.
+    start_step = 0
+    resume_path = cfg.training.get("resume", "")
+    if resume_path:
+        from eb_jepa.training_utils import load_checkpoint
+
+        resume_optim = bool(cfg.training.get("resume_optim", True))
+        info = load_checkpoint(
+            resume_path,
+            raw_module,
+            optimizer=opt if resume_optim else None,
+            scheduler=sched.scheduler if resume_optim else None,
+            device=device,
+            strict=False,
+        )
+        start_step = int(info.get("step", 0)) if resume_optim else 0
+        logger.info(
+            f"resumed from {resume_path} @ saved step {info.get('step', 0)} "
+            f"(optimizer/scheduler {'restored' if resume_optim else 'fresh — new LR'})"
+        )
 
     amp_dtype = torch.bfloat16 if cfg.training.get("amp", True) else torch.float32
     run = None
@@ -401,7 +433,23 @@ def train(cfg, device=None):
     cumulative_flops = 0.0
     loop_start = time.time()
 
-    step = 0
+    # Periodic FULL checkpoint (model + optimizer + scheduler + step) every N steps ->
+    # rolling ckpt_latest.pt, so the run is reusable/resumable at any time regardless
+    # of the LR schedule. 0 disables. Frozen ESMC/Evo2 tables are persistent=False, so
+    # these stay small (learned params + AdamW state only).
+    ckpt_every = int(cfg.training.get("ckpt_every", 0))
+
+    def _save_full(step: int, epoch: int):
+        save_checkpoint(
+            os.path.join(cfg.meta.run_dir, "ckpt_latest.pt"),
+            raw_module,
+            opt,
+            sched.scheduler,
+            epoch=epoch,
+            step=step,
+        )
+
+    step = start_step
     stop = False
     for epoch in range(cfg.optim.epochs):
         if stop:
@@ -476,6 +524,8 @@ def train(cfg, device=None):
                     run.log(metrics, step=step)
             if eval_every and step % eval_every == 0:
                 _run_eval(step, train_loss=out["loss"].item())
+            if is_main(rank) and ckpt_every and step % ckpt_every == 0:
+                _save_full(step, epoch)
             if max_steps and step >= max_steps:
                 stop = True
                 break
@@ -495,11 +545,14 @@ def train(cfg, device=None):
     if step > 0:
         _run_eval(step, train_loss=out["loss"].item())
     # always save the final encoder (max_steps/max_minutes stop mid-epoch) so the
-    # trained backbone is available for post-hoc probing / t-SNE / scaling laws.
+    # trained backbone is available for post-hoc probing / t-SNE / scaling laws, plus a
+    # final full checkpoint (resumable) for continuing the run later.
     if is_main(rank):
         save_checkpoint(
             os.path.join(cfg.meta.run_dir, "encoder_final.pt"), raw_encoder, step=step
         )
+        if ckpt_every:
+            _save_full(step, cfg.optim.epochs)
     if is_ddp:
         dist.destroy_process_group()
     return raw_encoder

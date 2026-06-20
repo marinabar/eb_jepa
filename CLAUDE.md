@@ -265,10 +265,10 @@ The hackathon runs on **Dalia** at IDRIS (Hack The World(s) / Vivatech event). A
 
 **Architecture mismatch (critical):** the login node is **x86_64**, but the compute nodes are **aarch64** (Grace ARM) with **NVIDIA GB200** GPUs (sm_100, 198 GB HBM each). Binaries/venvs built on the login node fail on compute with "Exec format error". **Build the Python env *on* a compute node** via `srun`. Compute nodes have internet.
 
-**SLURM:** one partition `defq`, 18 nodes × 4 GB200 (72 GPUs). All nodes are held by an **ACTIVE reservation `Vivatech`** (account `vivatech`), so every job MUST pass `--reservation=Vivatech` or it sits PENDING with "ReqNodeNotAvail". Default `srun` gives 1 CPU — pass `--cpus-per-task=N`. `--pty` does **not** work over non-interactive SSH; omit it.
+**SLURM:** one partition `defq`, 18 nodes × 4 GB200 (72 GPUs). All nodes are held by an **ACTIVE reservation `Vivatech`**, so every job MUST pass `--reservation=Vivatech` or it sits PENDING with "ReqNodeNotAvail". The SLURM **account is `vivatech-unaite`** (the group name and the user's default account, so `--account` may be omitted; if passed it must be `vivatech-unaite` — `vivatech` is rejected as an invalid account/partition combination). **Hard group GPU cap: the `vivatech-unaite` association has `GrpTRES gres/gpu=3`, so the whole team can hold at most 3 GPUs concurrently** (shared across all members) — a job asking for 4 GPUs can NEVER schedule (sits PENDING on `AssocGrpGRES`). Size jobs to ≤3 GPUs; for throughput, prefer **single-GPU jobs (up to 3 concurrent)** with a large per-GPU batch rather than one multi-GPU DDP run. Default `srun` gives 1 CPU — pass `--cpus-per-task=N`. `--pty` does **not** work over non-interactive SSH; omit it. Watch for idle interactive `bash` jobs (`squeue -u <user>`) silently holding GPUs against the cap.
 
 ```bash
-srun --reservation=Vivatech --partition=defq --gres=gpu:b200:4 \
+srun --reservation=Vivatech --account=vivatech-unaite --partition=defq --gres=gpu:b200:4 \
      --cpus-per-task=64 --time=HH:MM:SS \
      /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python script.py
 ```
