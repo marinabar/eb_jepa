@@ -68,7 +68,7 @@ optim:
   adamw_beta2: 0.95
   adamw_eps: 1.0e-8
   epochs: 100
-  max_steps: 8000           # caps the streaming run (far below one epoch/rank)
+  max_steps: 0              # no step cap; runs until max_minutes / epochs
   max_grad_norm: 1.0
 
 training:

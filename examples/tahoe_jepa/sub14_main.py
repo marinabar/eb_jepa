@@ -163,57 +163,115 @@ def _encode_eval(model, eval_views: dict, device, train_dtype, chunk: int) -> to
     return torch.cat(reps, dim=0)
 
 
-def run_eval(model, eval_views, eval_meta, eval_dir, step, device, train_dtype, run, cfg):
-    from eb_jepa.singlecell.probes import run_probe_suite
-    from eb_jepa.singlecell.visualize import effective_rank, plot_tsne_grid, tsne_embed
+def _eval_loss(model, eval_multi, sigreg, sigreg_weight, jepa_kind, device, loss_cells):
+    """Held-out LeJEPA loss on a small multi-view batch (same recipe as training).
 
-    reps = _encode_eval(model, eval_views, device, train_dtype, int(cfg.eval.get("encode_chunk", 256)))
-    metrics = {"eval/effective_rank": effective_rank(reps)}
+    Mirrors the eb_jepa runs' ``eval/loss`` / ``eval/invariance_loss`` /
+    ``eval/sigreg_loss`` keys so sub14 sits in the same dashboards. SIGReg's
+    lock-step RNG counter is saved/restored so the eval doesn't perturb the
+    training projection sequence.
+    """
+    if eval_multi is None:
+        return {}
+    saved_step = sigreg.step
+    g, b, p = eval_multi["gene_ids"], eval_multi["bin_ids"], eval_multi["padding_mask"]
+    nv = int(eval_multi["n_views"])
+    n = min(int(loss_cells), g.size(1))
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        projs, sig = [], torch.zeros((), device=device, dtype=torch.float32)
+        for vw in range(nv):
+            out = model(g[vw, :n].to(device), b[vw, :n].to(device), p[vw, :n].to(device))
+            projs.append(out.cell_projection)
+            sig = sig + sigreg(out.cell_projection).float()
+        jepa = jepa_pair_loss(projs, kind=jepa_kind).float()
+        siga = sig / float(nv)
+        loss = jepa + sigreg_weight * siga
+    if was_training:
+        model.train()
+    sigreg.step = saved_step
+    return {
+        "eval/loss": float(loss),
+        "eval/invariance_loss": float(jepa),
+        "eval/sigreg_loss": float(siga),
+    }
+
+
+def run_eval(model, eval_single, eval_meta, eval_multi, sigreg, sigreg_weight, jepa_kind,
+             eval_dir, step, device, train_dtype, run, cfg):
+    """Detached probes + per-class t-SNE + held-out loss, logged with the SAME
+    wandb keys as the eb_jepa LeJEPA runs (probe/<key>/<metric>, repr/effective_rank,
+    tsne/<class>, eval/loss) so sub14 lands in the shared dashboards."""
+    from eb_jepa.singlecell.probes import run_probe_suite
+    from eb_jepa.singlecell.visualize import effective_rank, plot_tsne_single, tsne_embed
+
+    reps = _encode_eval(model, eval_single, device, train_dtype, int(cfg.eval.get("encode_chunk", 256)))
+    metrics: dict = {}
     try:
-        probe = run_probe_suite(reps, eval_meta)
-        for k, v in probe.items():
-            val = v.get("balanced_accuracy", v.get("r2")) if isinstance(v, dict) else v
-            if val is not None:
-                metrics[f"eval/{k}"] = float(val)
+        suite = run_probe_suite(reps, dict(eval_meta))  # {"clf/organ": {...}, "reg/...": {...}}
+        for key, m in suite.items():
+            for mk, mv in m.items():
+                metrics[f"probe/{key}/{mk}"] = float(mv)
     except Exception:
         logger.warning("probe suite failed at step %d", step, exc_info=True)
-    # t-SNE grid (design-system figure)
+    metrics["repr/effective_rank"] = float(effective_rank(reps))
+    metrics.update(_eval_loss(model, eval_multi, sigreg, sigreg_weight, jepa_kind, device,
+                              int(cfg.eval.get("loss_cells", 128))))
+
+    # per-class t-SNE panels (same figures + keys as eb_jepa periodic_eval)
+    paths: dict = {}
     try:
         os.makedirs(eval_dir, exist_ok=True)
         emb = tsne_embed(reps, seed=int(cfg.meta.seed), perplexity=float(cfg.eval.get("perplexity", 30.0)))
-        classes = list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"]))
-        path = plot_tsne_grid(
-            emb,
-            {c: eval_meta.get(c) for c in classes if c in eval_meta},
-            os.path.join(eval_dir, f"tsne_step{step}.png"),
-            step=step,
-        )
-        if run is not None:
-            import wandb
-
-            metrics["eval/tsne"] = wandb.Image(path)
+        for c in list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])):
+            if c in eval_meta:
+                p = os.path.join(eval_dir, f"tsne_{c}_step{step:06d}.png")
+                plot_tsne_single(emb, eval_meta[c], p, name=c, step=step)
+                paths[c] = p
     except Exception:
         logger.warning("t-SNE snapshot failed at step %d", step, exc_info=True)
 
     if run is not None:
-        run.log(metrics, step=step)
-    key = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
-    logger.info(f"[eval @ {step}] " + " | ".join(f"{k.split('/', 1)[-1]}={v:.3f}" for k, v in key.items()))
+        log = dict(metrics)
+        try:
+            import wandb
+
+            for c, p in paths.items():
+                log[f"tsne/{c}"] = wandb.Image(p, caption=f"step {step}")
+        except Exception:
+            pass
+        run.log(log, step=step)
+
+    logger.info(
+        f"[eval @ {step}] effective_rank={metrics['repr/effective_rank']:.2f}"
+        + (f" | eval/loss={metrics['eval/loss']:.3f}" if "eval/loss" in metrics else "")
+        + "".join(
+            f" | {k.split('/', 1)[-1]}={v:.3f}"
+            for k, v in metrics.items()
+            if k.startswith("probe/") and k.endswith("balanced_accuracy")
+        )
+    )
 
 
-def build_eval_set(dataset, collator_cls_args, cfg, rank):
-    """Rank-0 fixed, diverse eval set: single deterministic view (no subsample)."""
+def build_eval_set(dataset, collator_cls_args, cfg):
+    """Rank-0 fixed eval set. ``single`` = one deterministic full view (probes /
+    t-SNE on the pre-projection rep); ``multi`` = a small V-view batch for the
+    held-out LeJEPA loss (same view recipe as training)."""
     n_eval = int(cfg.eval.get("eval_cells", 0))
     items = dataset.sample_items(n_eval)
-    eval_collator = Sub14Collator(
+    single = Sub14Collator(
+        **collator_cls_args, num_views=1, binomial_subsample=None, seed=int(cfg.meta.seed),
+    )(items)
+    meta = {k: single[k] for k in ("organ", "cell_line_id", "drug", "moa_fine", "sample", "plate") if k in single}
+    n_loss = max(128, int(cfg.eval.get("loss_cells", 128)))
+    multi = Sub14Collator(
         **collator_cls_args,
-        num_views=1,
-        binomial_subsample=None,  # deterministic eval view
+        num_views=int(cfg.data.get("n_views", 4)),
+        binomial_subsample=cfg.data.get("binomial_subsample", None),
         seed=int(cfg.meta.seed),
-    )
-    views = eval_collator(items)
-    meta = {k: views[k] for k in ("organ", "cell_line_id", "drug", "moa_fine", "sample", "plate") if k in views}
-    return views, meta
+    )(items[:n_loss])
+    return single, meta, multi
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +361,7 @@ def train(cfg, device=None):
 
     # wandb + eval set (rank 0)
     run = None
-    eval_views = eval_meta = eval_dir = None
+    eval_single = eval_meta = eval_multi = eval_dir = None
     if is_main(rank):
         if cfg.wandb.get("enabled", False):
             from eb_jepa.training_utils import setup_wandb
@@ -319,16 +377,17 @@ def train(cfg, device=None):
                 num_bins=int(cfg.data.get("num_bins", 16)),
                 genes_per_bin=int(cfg.data.get("genes_per_bin", 32)),
             )
-            eval_views, eval_meta = build_eval_set(dataset, collator_args, cfg, rank)
-            logger.info(f"eval set: {eval_views['batch_size']} cells -> {eval_dir}")
+            eval_single, eval_meta, eval_multi = build_eval_set(dataset, collator_args, cfg)
+            logger.info(f"eval set: {eval_single['batch_size']} cells -> {eval_dir}")
 
     n_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
     if is_main(rank):
         logger.info(f"trainable params: {n_params:,} | n_pc_genes={pc.n_pc_genes} | dtype={train_dtype}")
 
     def _eval(step):
-        if is_main(rank) and eval_views is not None:
-            run_eval(raw_module, eval_views, eval_meta, eval_dir, step, device, train_dtype, run, cfg)
+        if is_main(rank) and eval_single is not None:
+            run_eval(raw_module, eval_single, eval_meta, eval_multi, sigreg, sigreg_weight,
+                     jepa_kind, eval_dir, step, device, train_dtype, run, cfg)
         if is_ddp:
             dist.barrier()
 
@@ -381,17 +440,22 @@ def train(cfg, device=None):
             if is_main(rank) and step % log_every == 0:
                 elapsed = max(time.time() - loop_start, 1e-9)
                 cells = step * int(cfg.data.batch_size) * world
+                g_per_view = int(cfg.data.get("num_bins", 16)) * int(cfg.data.get("genes_per_bin", 32))
+                # Same metric keys as the eb_jepa LeJEPA runs so sub14 shares the
+                # dashboards: loss / invariance_loss / sigreg_loss / lr / data,throughput.
                 m = {
                     "loss": float(loss.detach().item()),
-                    "jepa": float(jepa.detach().item()),
-                    "sigreg": float(sigreg_avg.detach().item()),
+                    "invariance_loss": float(jepa.detach().item()),
+                    "sigreg_loss": float(sigreg_avg.detach().item()),
+                    "lr": float(cfg.optim.get("adamw_lr", 2e-4)),  # constant (no scheduler)
                     "epoch": epoch,
                     "data/cells_seen": cells,
+                    "data/tokens_seen": cells * n_views * g_per_view,
                     "throughput/cells_per_s": cells / elapsed,
                 }
                 logger.info(
-                    f"step {step} | loss={m['loss']:.4f} jepa={m['jepa']:.4f} "
-                    f"sigreg={m['sigreg']:.3f} | {m['throughput/cells_per_s']:.0f} cells/s"
+                    f"step {step} | loss={m['loss']:.4f} inv={m['invariance_loss']:.4f} "
+                    f"sigreg={m['sigreg_loss']:.3f} | {m['throughput/cells_per_s']:.0f} cells/s"
                 )
                 if run is not None:
                     run.log(m, step=step)

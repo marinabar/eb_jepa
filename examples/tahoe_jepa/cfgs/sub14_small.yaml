@@ -1,0 +1,86 @@
+# SMALL Subliminal 1.4 port — fast-iteration twin of big03_small.
+#
+# Mirrors big03_small's SCALE + fast-iteration setup (d256 / 2 layers / 4 heads,
+# the 16-shard tahoe-subset, max_steps=2500, single-GPU, eval every 200, compile
+# + grad_checkpoint off) but keeps the SUBLIMINAL 1.4 RECIPE intact: sigmoid
+# attention, per-cell quantile thermometer counts, Muon+AdamW (no scheduler),
+# pairwise-cosine JEPA + SIGReg. Trains in minutes for architecture/lambda checks.
+#
+# Launch (1 GPU):
+#   torchrun --nproc_per_node=1 -m examples.tahoe_jepa.sub14_main run \
+#       --config examples/tahoe_jepa/cfgs/sub14_small.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/sub14_small
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset   # 16 spread-out shards
+  split: train
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 32             # mirror big03_small
+  num_workers: 6
+  pin_mem: true
+  max_cells: 0
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  num_bins: 16
+  genes_per_bin: 32          # max_genes_per_cell = 512
+  n_views: 4
+  binomial_subsample:
+    enabled: true
+    p_min: 0.5
+    p_max: 0.9
+
+model:
+  d_model: 256               # << big03_small scale
+  n_heads: 4                 # head_dim 64
+  n_layers: 2
+  d_ff: 1024                 # 4 * d_model
+  dropout: 0.1
+  proj_dim: 128
+  attention_activation: sigmoid
+  freeze_features: true
+  grad_checkpoint: false     # tiny model -> no recompute needed
+  compile: false             # faster startup for quick iteration
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+
+loss:
+  sigreg_weight: 0.4         # sub14 recipe
+  jepa_loss: cosine
+  sigreg_slices: 256
+  sigreg_knots: 17
+  sigreg_t_max: 3.0
+
+optim:
+  muon_lr: 2.0e-4
+  muon_weight_decay: 0.1
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  adamw_lr: 2.0e-4
+  adamw_weight_decay: 0.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 1.0e-8
+  epochs: 100
+  max_steps: 0               # no step cap; runs until max_minutes / epochs
+  max_grad_norm: 1.0
+
+training:
+  native_bf16: true
+  log_every: 10
+  ckpt_every_steps: 1000
+  max_minutes: 45
+
+eval:
+  enabled: true
+  eval_every: 200            # mirror big03_small
+  eval_cells: 1024
+  encode_chunk: 128
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
