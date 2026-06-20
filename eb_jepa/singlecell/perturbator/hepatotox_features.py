@@ -40,6 +40,8 @@ import math
 
 import torch
 
+from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
+
 # --------------------------------------------------------------------------- #
 # Structural-alert SMARTS libraries.                                          #
 # Reused verbatim from virtual-pathway-cyp:                                   #
@@ -356,5 +358,76 @@ class HepatotoxPathwayFeaturizer:
         """Named feature dict (handy for reports / debugging)."""
         vec = self.featurize(smiles)
         return {n: float(v) for n, v in zip(self.feature_names, vec.tolist())}
+
+    __call__ = featurize
+
+
+class HepatotoxActionFeaturizer:
+    """Dose-aware action featurizer mirroring :class:`DrugFeaturizer`'s interface.
+
+    Wraps a :class:`HepatotoxPathwayFeaturizer` so the perturbator can consume the
+    hepatotoxicity virtual-pathway scores as its **action** vector while still
+    seeing the dose. The action vector is the pathway feature block followed by the
+    **same two dose channels** ``[validity_flag, log_conc]`` that ``DrugFeaturizer``
+    appends (controls / missing dose -> sentinel ``[0, 0]``), so
+    ``examples/tahoe_perturbator/main.py`` can treat both featurizers uniformly via
+    the shared ``.action_dim`` / ``.featurize(smiles, log_conc)`` /
+    ``.featurize_batch(smiles_list, log_conc)`` contract.
+
+    Args:
+        pathway_featurizer: an existing :class:`HepatotoxPathwayFeaturizer`, or
+            ``None`` to build a default one.
+        **pathway_kwargs: forwarded to :class:`HepatotoxPathwayFeaturizer` when
+            ``pathway_featurizer`` is not given.
+    """
+
+    def __init__(
+        self,
+        pathway_featurizer: "HepatotoxPathwayFeaturizer | None" = None,
+        **pathway_kwargs,
+    ):
+        self.pathway = pathway_featurizer or HepatotoxPathwayFeaturizer(**pathway_kwargs)
+        # expose the underlying chemistry contract for downstream attribution
+        self.feature_names = self.pathway.feature_names
+        self.surrogate_mask = self.pathway.surrogate_mask
+        self.has_rdkit = self.pathway.has_rdkit
+
+    @property
+    def drug_dim(self) -> int:
+        """Dimension of the SMILES-only (pathway) feature block."""
+        return self.pathway.feature_dim
+
+    @property
+    def action_dim(self) -> int:
+        """Full action dimension: pathway features + [dose_validity, log_conc]."""
+        return self.pathway.feature_dim + 2
+
+    def drug_features(self, smiles: str | None) -> torch.Tensor:
+        """Cached SMILES-only pathway features ``[drug_dim]``."""
+        return self.pathway.featurize(smiles)
+
+    def featurize(self, smiles: str | None, log_conc: float | None = None) -> torch.Tensor:
+        """One action vector ``[action_dim]`` = pathway features ++ dose channels."""
+        dose = DrugFeaturizer._dose_channels(log_conc)
+        return torch.cat([self.pathway.featurize(smiles), dose])
+
+    def featurize_batch(self, smiles: list[str | None], log_conc=None) -> torch.Tensor:
+        """Stack :meth:`featurize` over a batch -> ``[B, action_dim]``.
+
+        ``log_conc`` may be ``None`` (all controls), a python list, or a 1-D tensor.
+        """
+        n = len(smiles)
+        if log_conc is None:
+            doses: list = [None] * n
+        elif torch.is_tensor(log_conc):
+            doses = log_conc.tolist()
+        else:
+            doses = list(log_conc)
+        return torch.stack([self.featurize(smiles[i], doses[i]) for i in range(n)])
+
+    def set_predictor(self, feature_name: str, fn) -> None:
+        """Forward to the underlying pathway featurizer (trained-predictor injection)."""
+        self.pathway.set_predictor(feature_name, fn)
+        self.surrogate_mask = self.pathway.surrogate_mask
 
     __call__ = featurize

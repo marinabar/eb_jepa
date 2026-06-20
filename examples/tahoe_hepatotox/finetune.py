@@ -74,14 +74,15 @@ def _make_liver_dataset_factory(liver_cell_lines: set):
     return factory
 
 
-def run(config: str = "examples/tahoe_hepatotox/cfgs/finetune.yaml", **overrides):
-    cfg = load_config(config, cli_overrides=overrides or None)
-    os.makedirs(cfg.meta.run_dir, exist_ok=True)
+def resolve_liver_cell_lines(maps_path: str | None) -> set:
+    """Resolve the hepatic (``Organ == "Liver"``) ``CVCL_*`` cell-line set.
 
-    # Resolve the hepatic cell-line set from the prebuilt map (same maps.pt the
-    # sub14 loader already reads for organ labels).
-    liver = set()
-    maps_path = cfg.data.get("maps_path")
+    Single source of truth for the liver filter, reused by the perturbator trainer so
+    it filters the Tahoe stream exactly as this finetune does. Reads the prebuilt
+    ``cell_line_to_organ`` map from ``maps_path`` (the same ``maps.pt`` the loaders
+    use for organ labels). Raises if the set is empty / the map is missing.
+    """
+    liver: set = set()
     if maps_path and os.path.exists(maps_path):
         cl2organ = torch.load(maps_path).get("cell_line_to_organ", {})
         liver = {cvcl for cvcl, organ in cl2organ.items() if organ == "Liver"}
@@ -91,6 +92,16 @@ def run(config: str = "examples/tahoe_hepatotox/cfgs/finetune.yaml", **overrides
             "Build maps.pt first (eb_jepa.datasets.tahoe.preprocess) — it must contain "
             "cell_line_to_organ with Organ=='Liver' entries."
         )
+    return liver
+
+
+def run(config: str = "examples/tahoe_hepatotox/cfgs/finetune.yaml", **overrides):
+    cfg = load_config(config, cli_overrides=overrides or None)
+    os.makedirs(cfg.meta.run_dir, exist_ok=True)
+
+    # Resolve the hepatic cell-line set from the prebuilt map (same maps.pt the
+    # sub14 loader already reads for organ labels).
+    liver = resolve_liver_cell_lines(cfg.data.get("maps_path"))
     logger.info("liver finetune: %d hepatic cell lines -> %s", len(liver), sorted(liver))
 
     # Inject the liver-filtering dataset into sub14_main.build_loader without touching

@@ -20,6 +20,7 @@ data:
   num_workers: 8
   pin_mem: true
   max_cells: 0
+  liver_only: false      # true -> stream only hepatic (Organ=="Liver") cell lines
   maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
 
 encoder:
@@ -37,6 +38,7 @@ encoder:
   attention_activation: sigmoid
 
 featurizer:
+  type: morgan           # morgan | hepatotox (hepatotox = virtual-pathway action)
   n_bits: 1024           # Morgan fingerprint length (hash fallback if no rdkit)
   radius: 2
   use_descriptors: true  # append MolWt/MolLogP/TPSA/HAcceptors/HDonors/RotBonds

@@ -35,6 +35,7 @@ from eb_jepa.datasets.tahoe.dataset import TahoeConfig, TahoeIterableDataset
 from eb_jepa.logging import get_logger
 from eb_jepa.schedulers import CosineWithWarmup
 from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
+from eb_jepa.singlecell.perturbator.hepatotox_features import HepatotoxActionFeaturizer
 from eb_jepa.singlecell.perturbator.flow import flow_matching_loss, predict_perturbed
 from eb_jepa.singlecell.perturbator.losses import sliced_wasserstein
 from eb_jepa.singlecell.perturbator.matching import build_strata
@@ -100,6 +101,42 @@ def encode_cells(encoder, batch, device, amp: bool) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
+# Drug / dose action featurizer (Morgan or hepatotox virtual pathways)         #
+# --------------------------------------------------------------------------- #
+def build_featurizer(cfg):
+    """Build the action featurizer selected by ``featurizer.type`` (default morgan).
+
+    Both featurizers expose the SAME contract (``.action_dim`` /
+    ``.featurize(smiles, log_conc)`` / ``.featurize_batch``), so the training loop is
+    featurizer-agnostic:
+
+    - ``morgan``   : :class:`DrugFeaturizer` — Morgan fingerprint + RDKit descriptors
+      + dose channels (general perturbator).
+    - ``hepatotox``: :class:`HepatotoxActionFeaturizer` — hepatotoxicity virtual-pathway
+      scores (CYP / BSEP / NRF2 / mito-tox surrogates) + the SAME dose channels.
+    """
+    ftype = str(cfg.featurizer.get("type", "morgan")).lower()
+    if ftype == "morgan":
+        feat = DrugFeaturizer(
+            n_bits=int(cfg.featurizer.get("n_bits", 1024)),
+            radius=int(cfg.featurizer.get("radius", 2)),
+            use_descriptors=bool(cfg.featurizer.get("use_descriptors", True)),
+        )
+    elif ftype == "hepatotox":
+        feat = HepatotoxActionFeaturizer(
+            include_bsep=bool(cfg.featurizer.get("include_bsep", True)),
+            include_descriptors=bool(cfg.featurizer.get("include_descriptors", True)),
+            cyp_use_alerts=bool(cfg.featurizer.get("cyp_use_alerts", True)),
+        )
+    else:
+        raise ValueError(f"unknown featurizer.type {ftype!r} (expected morgan|hepatotox)")
+    if not feat.has_rdkit:
+        logger.warning("RDKit not available — using deterministic hash featurizer.")
+    logger.info(f"featurizer type={ftype} action_dim={feat.action_dim}")
+    return feat
+
+
+# --------------------------------------------------------------------------- #
 # Data                                                                         #
 # --------------------------------------------------------------------------- #
 def build_loader(cfg, pc, rank=0, world=1):
@@ -109,7 +146,22 @@ def build_loader(cfg, pc, rank=0, world=1):
     maps = {}
     if cfg.data.get("maps_path") and os.path.exists(cfg.data.maps_path):
         maps = torch.load(cfg.data.maps_path)
-    dataset = TahoeIterableDataset(
+    # Optional liver-only stream: reuse the EXACT filtering used by the hepatotox
+    # finetune (LiverTahoeIterableDataset + the shared liver-cell-line resolver).
+    if bool(cfg.data.get("liver_only", False)):
+        from examples.tahoe_hepatotox.finetune import (
+            LiverTahoeIterableDataset,
+            resolve_liver_cell_lines,
+        )
+
+        liver = resolve_liver_cell_lines(cfg.data.get("maps_path"))
+        logger.info(f"liver_only: streaming {len(liver)} hepatic cell lines -> {sorted(liver)}")
+        dataset_cls = lambda *a, **k: LiverTahoeIterableDataset(  # noqa: E731
+            *a, liver_cell_lines=liver, **k
+        )
+    else:
+        dataset_cls = TahoeIterableDataset
+    dataset = dataset_cls(
         data_cfg,
         binner=None,
         cell_line_to_organ=maps.get("cell_line_to_organ"),
@@ -249,13 +301,7 @@ def train(cfg, device=None):
     loader, dataset, _ = build_loader(cfg, pc)
     encoder = build_frozen_encoder(cfg, pc, device)
 
-    featurizer = DrugFeaturizer(
-        n_bits=int(cfg.featurizer.get("n_bits", 1024)),
-        radius=int(cfg.featurizer.get("radius", 2)),
-        use_descriptors=bool(cfg.featurizer.get("use_descriptors", True)),
-    )
-    if not featurizer.has_rdkit:
-        logger.warning("RDKit not available — using deterministic hash featurizer.")
+    featurizer = build_featurizer(cfg)
 
     objective = str(cfg.loss.get("objective", "flow_matching"))
     perturbator = Perturbator(

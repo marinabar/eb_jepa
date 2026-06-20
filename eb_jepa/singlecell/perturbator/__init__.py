@@ -9,13 +9,17 @@ matching per stratum ``(cell_line_id, plate)``.
 """
 
 from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
-from eb_jepa.singlecell.perturbator.hepatotox_features import HepatotoxPathwayFeaturizer
+from eb_jepa.singlecell.perturbator.hepatotox_features import (
+    HepatotoxActionFeaturizer,
+    HepatotoxPathwayFeaturizer,
+)
 from eb_jepa.singlecell.perturbator.losses import sliced_wasserstein
 from eb_jepa.singlecell.perturbator.matching import build_strata, Stratum
 from eb_jepa.singlecell.perturbator.model import Perturbator
 
 __all__ = [
     "DrugFeaturizer",
+    "HepatotoxActionFeaturizer",
     "HepatotoxPathwayFeaturizer",
     "sliced_wasserstein",
     "build_strata",

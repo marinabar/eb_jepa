@@ -24,7 +24,7 @@ from eb_jepa.singlecell.perturbator.visualize import (
 class TestFeaturize:
     def test_fixed_dim_deterministic(self):
         feat = DrugFeaturizer(n_bits=64, radius=2)
-        assert not feat.has_rdkit, "test environment must run the rdkit-free fallback"
+        # Deterministic + fixed-dim under either backend (rdkit or the hash fallback).
         a = feat.featurize("CCO", -7.0)
         b = feat.featurize("CCO", -7.0)
         assert a.shape == (feat.action_dim,)
