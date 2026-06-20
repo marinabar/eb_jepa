@@ -63,8 +63,9 @@ training:
 
 eval:
   enabled: true
-  eval_cells: 1024           # held out from SSL training (shared across scales)
-  eval_every: 300            # probes + t-SNE + held-out LeJEPA loss every N steps
+  eval_cells: 512            # held out from SSL training (shared across scales)
+  eval_every: 100000         # baseline(step0)+final eval only -> minimal stall on the
+                             # short rung budgets (the post-loop final eval is the point)
   loss_cells: 128            # V-view batch for the held-out eval loss
   classes: [organ, cell_line_id, drug, moa_fine]
   encode_chunk: 128
