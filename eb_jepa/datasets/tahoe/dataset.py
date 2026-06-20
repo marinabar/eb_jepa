@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from eb_jepa.datasets.tahoe.normalizer import QuantileBinner, cp10k_log1p
 
@@ -66,6 +66,8 @@ class TahoeConfig:
     pin_mem: bool = False
     seed: int = 0
     max_cells: int = 0  # 0 = all; >0 truncates (debug/smoke)
+    streaming: bool = False  # IterableDataset: stream shards (full-dataset training)
+    shuffle_buffer: int = 16384  # streaming: per-worker reservoir for row shuffling
 
 
 def _read_parquet_dir(data_dir: str, columns: list[str]):
@@ -96,6 +98,39 @@ def parse_log_conc(drugname_drugconc: str) -> float:
     if conc is None or conc <= 0:
         return float("nan")
     return math.log10(float(conc) * 1e-6)
+
+
+def _make_item(genes, vals, cached, meta, binner, cell_line_to_organ, sample_to_logconc):
+    """Build one cell's item dict from raw arrays + metadata (shared by datasets).
+
+    ``meta`` is keyed by the raw parquet column names. ``cached`` selects whether the
+    CLS marker has already been stripped and values are pre-normalized (cache) or
+    raw counts with a leading CLS marker (raw expression_data).
+    """
+    if not cached:
+        genes, vals = genes[1:], vals[1:]  # strip CLS marker at position 0
+    token_ids = torch.from_numpy(genes.copy()).long()
+    v = torch.from_numpy(vals.copy()).float()
+    assert token_ids.shape == v.shape, "genes/values misaligned"
+    values = v if cached else cp10k_log1p(v)
+    sample = meta.get("sample")
+    cell_line_id = meta.get("cell_line_id")
+    item = {
+        "gene_token_ids": token_ids,
+        "values": values,
+        "drug": meta.get("drug"),
+        "sample": sample,
+        "cell_line_id": cell_line_id,
+        "organ": (cell_line_to_organ or {}).get(cell_line_id),
+        "moa_fine": meta.get("moa-fine"),
+        "plate": meta.get("plate"),
+        "canonical_smiles": meta.get("canonical_smiles"),
+        "barcode": meta.get("BARCODE_SUB_LIB_ID"),
+        "log_conc": (sample_to_logconc or {}).get(sample, float("nan")),
+    }
+    if binner is not None:
+        item["bin_ids"] = binner.bin(token_ids, values)
+    return item
 
 
 class TahoeDataset(Dataset):
@@ -154,33 +189,127 @@ class TahoeDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         genes = self._genes[i].values.to_numpy(zero_copy_only=False)
         vals = self._value[i].values.to_numpy(zero_copy_only=False)
-        if not self._cached:
-            # raw expression_data: strip the CLS marker at position 0 of both
-            genes, vals = genes[1:], vals[1:]
-        token_ids = torch.from_numpy(genes.copy()).long()
-        v = torch.from_numpy(vals.copy()).float()
-        assert token_ids.shape == v.shape, "genes/values misaligned"
+        meta = {c: self._table.column(c)[i].as_py() for c in self._meta_cols}
+        return _make_item(
+            genes, vals, self._cached, meta, self.binner,
+            self.cell_line_to_organ, self.sample_to_logconc,
+        )
 
-        # cache already holds CP10k+log1p values; raw counts need the transform
-        values = v if self._cached else cp10k_log1p(v)
-        sample = self._col("sample", i)
-        cell_line_id = self._col("cell_line_id", i)
-        item = {
-            "gene_token_ids": token_ids,
-            "values": values,
-            "drug": self._col("drug", i),
-            "sample": sample,
-            "cell_line_id": cell_line_id,
-            "organ": self.cell_line_to_organ.get(cell_line_id),
-            "moa_fine": self._col("moa-fine", i),
-            "plate": self._col("plate", i),
-            "canonical_smiles": self._col("canonical_smiles", i),
-            "barcode": self._col("BARCODE_SUB_LIB_ID", i),
-            "log_conc": self.sample_to_logconc.get(sample, float("nan")),
-        }
-        if self.binner is not None:
-            item["bin_ids"] = self.binner.bin(token_ids, values)
-        return item
+
+class TahoeIterableDataset(IterableDataset):
+    """Streaming reader for full-dataset training (no in-RAM table).
+
+    Shards the parquet files disjointly across (DDP rank, DataLoader worker) so the
+    union of all streams is one pass over the data with no overlap, reads one shard
+    at a time, and yields whole-cell items (same schema as ``TahoeDataset``). A
+    per-worker reservoir of ``config.shuffle_buffer`` items mixes rows across shards
+    so batches are not all-same-shard (important for SIGReg/invariance diversity).
+    Call ``set_epoch`` each epoch to reshuffle the shard order.
+    """
+
+    def __init__(
+        self,
+        config: TahoeConfig,
+        binner: Optional[QuantileBinner] = None,
+        cell_line_to_organ: Optional[dict] = None,
+        sample_to_logconc: Optional[dict] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        shuffle: bool = True,
+    ):
+        import pyarrow.parquet as pq
+
+        self.config = config
+        self.binner = binner
+        self.cell_line_to_organ = cell_line_to_organ or {}
+        self.sample_to_logconc = sample_to_logconc or {}
+        self.rank = rank
+        self.world_size = world_size
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.files = sorted(
+            glob.glob(os.path.join(config.data_dir, "**", "*.parquet"), recursive=True)
+        )
+        if not self.files:
+            raise FileNotFoundError(f"No parquet files under {config.data_dir!r}")
+        names = set(pq.read_schema(self.files[0]).names)
+        self._cached = "value" in names
+        self._value_col = "value" if self._cached else "expressions"
+        self._meta_cols = [c for c in _META_COLUMNS if c in names]
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _read_shard(self, f):
+        import pyarrow.parquet as pq
+
+        t = pq.read_table(f, columns=["genes", self._value_col] + self._meta_cols)
+        genes_col = t.column("genes")
+        val_col = t.column(self._value_col)
+        meta_cols = {c: t.column(c) for c in self._meta_cols}
+        for i in range(t.num_rows):
+            genes = genes_col[i].values.to_numpy(zero_copy_only=False)
+            vals = val_col[i].values.to_numpy(zero_copy_only=False)
+            meta = {c: meta_cols[c][i].as_py() for c in self._meta_cols}
+            yield _make_item(
+                genes, vals, self._cached, meta, self.binner,
+                self.cell_line_to_organ, self.sample_to_logconc,
+            )
+
+    def __iter__(self):
+        import random
+
+        from torch.utils.data import get_worker_info
+
+        info = get_worker_info()
+        wid = info.id if info else 0
+        nw = info.num_workers if info else 1
+        gid = self.rank * nw + wid  # global stream id
+        gn = self.world_size * nw  # number of disjoint streams
+        files = list(self.files)
+        if self.shuffle:
+            random.Random(self.config.seed + self.epoch).shuffle(files)
+        my_files = files[gid::gn]
+
+        buf_cap = max(1, int(self.config.shuffle_buffer)) if self.shuffle else 1
+        rng = random.Random(self.config.seed + self.epoch + 7919 * (gid + 1))
+        buf = []
+        for f in my_files:
+            for item in self._read_shard(f):
+                if buf_cap <= 1:
+                    yield item
+                    continue
+                buf.append(item)
+                if len(buf) >= buf_cap:
+                    j = rng.randrange(len(buf))
+                    buf[j], buf[-1] = buf[-1], buf[j]
+                    yield buf.pop()
+        rng.shuffle(buf)
+        for item in buf:
+            yield item
+
+    def sample_items(self, n_cells: int, max_per_file: int = 200):
+        """Read a fixed, diverse subset of ``n_cells`` items (for the eval/t-SNE set).
+
+        Spreads the draw across evenly-spaced shards so cell lines/drugs are mixed.
+        Deterministic (no shuffle) so the eval set is identical across snapshots.
+        """
+        import numpy as np
+
+        k = max(1, min(len(self.files), -(-n_cells // max_per_file)))
+        idxs = sorted(set(int(round(x)) for x in np.linspace(0, len(self.files) - 1, k)))
+        per = -(-n_cells // len(idxs))
+        items = []
+        for fi in idxs:
+            c = 0
+            for item in self._read_shard(self.files[fi]):
+                items.append(item)
+                c += 1
+                if c >= per or len(items) >= n_cells:
+                    break
+            if len(items) >= n_cells:
+                break
+        return items
 
 
 def _sample_indices(g: int, keep: int, generator=None) -> torch.Tensor:
@@ -281,23 +410,42 @@ def init_tahoe_data(
     binner: Optional[QuantileBinner] = None,
     cell_line_to_organ: Optional[dict] = None,
     sample_to_logconc: Optional[dict] = None,
+    rank: int = 0,
+    world_size: int = 1,
 ):
-    """Build train/val DataLoaders with the on-the-fly view collator.
+    """Build the train DataLoader with the on-the-fly view collator.
 
-    Standalone (bypasses the two_rooms/maze PipelineManager): returns a standard
-    DataLoader whose ``collate_fn`` generates the LeJEPA views. ``val`` reuses the
-    same dataset path with shuffle off (a dedicated val split dir is wired via a
-    separate config in M2/M3).
+    ``config.streaming`` selects the reader: the streaming ``TahoeIterableDataset``
+    (full-dataset training; shards across ``rank``/workers internally — do NOT add a
+    DistributedSampler) or the in-RAM ``TahoeDataset`` (small subsets / probing).
+    The ``collate_fn`` generates the LeJEPA views on the fly.
     """
     cfg = config
-    dataset = TahoeDataset(cfg, binner, cell_line_to_organ, sample_to_logconc)
     collator = TahoeCollator(cfg)
-    loader_kwargs = dict(
+    if getattr(cfg, "streaming", False):
+        dataset = TahoeIterableDataset(
+            cfg, binner, cell_line_to_organ, sample_to_logconc,
+            rank=rank, world_size=world_size, shuffle=(cfg.split == "train"),
+        )
+        train_loader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            pin_memory=cfg.pin_mem,
+            drop_last=True,
+            collate_fn=collator,
+            persistent_workers=cfg.num_workers > 0,
+        )
+        return train_loader, dataset
+
+    dataset = TahoeDataset(cfg, binner, cell_line_to_organ, sample_to_logconc)
+    train_loader = DataLoader(
+        dataset,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_mem,
         drop_last=True,
         collate_fn=collator,
+        shuffle=(cfg.split == "train"),
     )
-    train_loader = DataLoader(dataset, shuffle=(cfg.split == "train"), **loader_kwargs)
     return train_loader, dataset

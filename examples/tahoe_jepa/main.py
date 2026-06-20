@@ -171,51 +171,67 @@ def train(cfg, device=None):
         binner=binner,
         cell_line_to_organ=maps.get("cell_line_to_organ"),
         sample_to_logconc=maps.get("sample_to_logconc"),
+        rank=rank,
+        world_size=world,
     )
     collator = train_loader.collate_fn
 
-    # Held-out probe/eval split (cell-level, seeded): these cells are EXCLUDED from
-    # SSL training so probe metrics measure generalization, not memorization. The
-    # remainder is the SSL training set (a DistributedSampler shards it across ranks).
-    from torch.utils.data import DataLoader, Subset
-
+    streaming = bool(getattr(data_cfg, "streaming", False))
     eval_enabled = bool(cfg.get("eval", {}).get("enabled", False))
     n_eval = int(cfg.get("eval", {}).get("eval_cells", 0)) if eval_enabled else 0
-    n_eval = max(0, min(n_eval, len(dataset) - cfg.data.batch_size * max(world, 1)))
-    g_split = torch.Generator().manual_seed(cfg.meta.seed)
-    perm = torch.randperm(len(dataset), generator=g_split).tolist()
-    eval_idx, train_idx = perm[:n_eval], perm[n_eval:]
-    train_subset = Subset(dataset, train_idx)
-
-    loader_kwargs = dict(
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        pin_memory=cfg.data.pin_mem,
-        drop_last=True,
-        collate_fn=collator,
-    )
     sampler = None
-    if is_ddp:
-        from torch.utils.data import DistributedSampler
-
-        sampler = DistributedSampler(
-            train_subset, num_replicas=world, rank=rank, shuffle=True, drop_last=True
-        )
-        train_loader = DataLoader(train_subset, sampler=sampler, **loader_kwargs)
-    else:
-        train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
-
-    # held-out eval set (rank 0): the excluded cells, one clean full-gene view each
     eval_batch = eval_labels = eval_dir = None
-    do_eval = is_main(rank) and eval_enabled and n_eval > 0
-    if do_eval:
-        from examples.tahoe_jepa.eval_tsne import build_eval_set
 
-        eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
-        eval_dir = os.path.join(cfg.meta.run_dir, "eval")
-        logger.info(
-            f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
+    if streaming:
+        # init_tahoe_data already shards the stream across rank/workers (no
+        # DistributedSampler). The eval set is a fixed, diverse sample read from the
+        # shards (not held out — an infinite stream has no stable index space).
+        do_eval = is_main(rank) and eval_enabled and n_eval > 0
+        if do_eval:
+            from examples.tahoe_jepa.eval_tsne import build_eval_set
+
+            eval_batch, eval_labels = build_eval_set(
+                dataset, data_cfg, n_eval, seed=cfg.meta.seed
+            )
+            eval_dir = os.path.join(cfg.meta.run_dir, "eval")
+            logger.info(f"streaming eval set: {n_eval} cells -> {eval_dir}")
+    else:
+        # Held-out probe/eval split (cell-level, seeded): these cells are EXCLUDED
+        # from SSL training so probe metrics measure generalization, not memorization.
+        from torch.utils.data import DataLoader, Subset
+
+        n_eval = max(0, min(n_eval, len(dataset) - cfg.data.batch_size * max(world, 1)))
+        g_split = torch.Generator().manual_seed(cfg.meta.seed)
+        perm = torch.randperm(len(dataset), generator=g_split).tolist()
+        eval_idx, train_idx = perm[:n_eval], perm[n_eval:]
+        train_subset = Subset(dataset, train_idx)
+
+        loader_kwargs = dict(
+            batch_size=cfg.data.batch_size,
+            num_workers=cfg.data.num_workers,
+            pin_memory=cfg.data.pin_mem,
+            drop_last=True,
+            collate_fn=collator,
         )
+        if is_ddp:
+            from torch.utils.data import DistributedSampler
+
+            sampler = DistributedSampler(
+                train_subset, num_replicas=world, rank=rank, shuffle=True, drop_last=True
+            )
+            train_loader = DataLoader(train_subset, sampler=sampler, **loader_kwargs)
+        else:
+            train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
+
+        do_eval = is_main(rank) and eval_enabled and n_eval > 0
+        if do_eval:
+            from examples.tahoe_jepa.eval_tsne import build_eval_set
+
+            eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
+            eval_dir = os.path.join(cfg.meta.run_dir, "eval")
+            logger.info(
+                f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
+            )
 
     # model
     model = build_train_module(cfg).to(device)
@@ -258,7 +274,7 @@ def train(cfg, device=None):
     def _eval(step: int):
         from examples.tahoe_jepa.eval_tsne import periodic_eval
 
-        metrics, path = periodic_eval(
+        metrics, paths = periodic_eval(
             raw_encoder,
             eval_batch,
             eval_labels,
@@ -282,7 +298,7 @@ def train(cfg, device=None):
         logger.info(
             f"[eval @ {step}] "
             + " | ".join(f"{k.split('/', 1)[-1]}={v:.3f}" for k, v in key.items())
-            + f" -> {path}"
+            + f" -> {len(paths)} t-SNE panels in {eval_dir}"
         )
 
     # eval cadence is the SAME on every rank (so all reach the barrier together);
@@ -315,6 +331,8 @@ def train(cfg, device=None):
             break
         if sampler is not None:
             sampler.set_epoch(epoch)
+        elif streaming and hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)  # reshuffle shard order per epoch
         model.train()
         for batch in train_loader:
             batch = move_batch(batch, device)

@@ -29,11 +29,15 @@ def build_eval_set(dataset, data_cfg, n_cells: int = 0, seed: int = 0, idx=None)
     excluded from SSL training); otherwise sample ``n_cells`` (seeded). ``labels``
     maps each probe class (+ ``sample``) to its per-cell values.
     """
-    if idx is None:
+    if idx is not None:
+        items = [dataset[i] for i in idx]
+    elif hasattr(dataset, "sample_items"):  # streaming IterableDataset (no index space)
+        items = dataset.sample_items(n_cells)
+    else:
         g = torch.Generator().manual_seed(seed)
         n = len(dataset)
         idx = torch.randperm(n, generator=g)[: min(n_cells, n)].tolist()
-    items = [dataset[i] for i in idx]
+        items = [dataset[i] for i in idx]
 
     ecfg = copy.deepcopy(data_cfg)
     ecfg.n_views = 1
@@ -105,20 +109,24 @@ def periodic_eval(
     metrics["repr/effective_rank"] = float(effective_rank(reps))
 
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"tsne_step{step:06d}.png")
     emb = tsne_embed(reps, seed=seed, perplexity=perplexity)
-    plot_tsne_grid(emb, {c: labels[c] for c in classes}, path, step=step)
+    paths = {}
+    for c in classes:
+        p = os.path.join(out_dir, f"tsne_{c}_step{step:06d}.png")
+        plot_tsne_single(emb, labels[c], p, name=c, step=step)
+        paths[c] = p
 
     if run is not None:
         log = dict(metrics)
         try:
             import wandb
 
-            log["tsne/representation"] = wandb.Image(path, caption=f"step {step}")
+            for c, p in paths.items():
+                log[f"tsne/{c}"] = wandb.Image(p, caption=f"step {step}")
         except Exception:
             pass
         run.log(log, step=step)
-    return metrics, path
+    return metrics, paths
 
 
 @torch.no_grad()
