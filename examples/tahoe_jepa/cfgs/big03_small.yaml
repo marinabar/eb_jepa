@@ -47,7 +47,8 @@ loss:
 
 optim:
   epochs: 100
-  max_steps: 2500          # big_lam03
+  max_steps: 0             # UNCAPPED — run until manual stop / SLURM --time; the LR
+                           # cosine then spans the full epochs horizon (~constant LR)
   lr: 0.002                # big_lam03 (NOT the collapse-sweep's 1e-4)
   weight_decay: 0.05
   warmup_ratio: 0.05
@@ -56,7 +57,7 @@ optim:
 
 eval:
   enabled: true
-  eval_every: 200
+  eval_every: 500          # within-run curve (effective_rank + probes) for a long run
   eval_cells: 1024
   loss_cells: 128
   classes: [organ, cell_line_id, drug, moa_fine]
@@ -67,7 +68,11 @@ training:
   amp: true
   log_every: 10
   ckpt_every_epoch: false
-  max_minutes: 45
+  ckpt_every: 1000         # full checkpoint (model+optim+sched+step) -> ckpt_latest.pt
+  max_minutes: 0           # no wall cap; stop via SLURM --time or scancel (periodic
+                           # ckpt_latest.pt every 1000 steps makes a stop loss-free)
+  # resume: /lustre/.../runs/big03_small_long/ckpt_latest.pt   # set to continue a run
+  # resume_optim: true     # false = load weights only, fresh LR schedule (any lr)
 
 wandb:
   enabled: true

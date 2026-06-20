@@ -289,6 +289,30 @@ def train(cfg, device=None):
         min_lr=cfg.optim.get("min_lr", 1e-6),
     )
 
+    # Optional resume / warm-start from a full checkpoint (ckpt_latest.pt). With
+    # resume_optim=True the optimizer+scheduler+step are restored (exact continuation);
+    # with resume_optim=False only the weights load and a FRESH schedule starts from
+    # step 0 — i.e. reuse the checkpoint under any new learning-rate init.
+    start_step = 0
+    resume_path = cfg.training.get("resume", "")
+    if resume_path:
+        from eb_jepa.training_utils import load_checkpoint
+
+        resume_optim = bool(cfg.training.get("resume_optim", True))
+        info = load_checkpoint(
+            resume_path,
+            raw_module,
+            optimizer=opt if resume_optim else None,
+            scheduler=sched.scheduler if resume_optim else None,
+            device=device,
+            strict=False,
+        )
+        start_step = int(info.get("step", 0)) if resume_optim else 0
+        logger.info(
+            f"resumed from {resume_path} @ saved step {info.get('step', 0)} "
+            f"(optimizer/scheduler {'restored' if resume_optim else 'fresh — new LR'})"
+        )
+
     amp_dtype = torch.bfloat16 if cfg.training.get("amp", True) else torch.float32
     run = None
     if is_main(rank) and cfg.wandb.get("enabled", False):
@@ -409,7 +433,23 @@ def train(cfg, device=None):
     cumulative_flops = 0.0
     loop_start = time.time()
 
-    step = 0
+    # Periodic FULL checkpoint (model + optimizer + scheduler + step) every N steps ->
+    # rolling ckpt_latest.pt, so the run is reusable/resumable at any time regardless
+    # of the LR schedule. 0 disables. Frozen ESMC/Evo2 tables are persistent=False, so
+    # these stay small (learned params + AdamW state only).
+    ckpt_every = int(cfg.training.get("ckpt_every", 0))
+
+    def _save_full(step: int, epoch: int):
+        save_checkpoint(
+            os.path.join(cfg.meta.run_dir, "ckpt_latest.pt"),
+            raw_module,
+            opt,
+            sched.scheduler,
+            epoch=epoch,
+            step=step,
+        )
+
+    step = start_step
     stop = False
     for epoch in range(cfg.optim.epochs):
         if stop:
@@ -484,6 +524,8 @@ def train(cfg, device=None):
                     run.log(metrics, step=step)
             if eval_every and step % eval_every == 0:
                 _run_eval(step, train_loss=out["loss"].item())
+            if is_main(rank) and ckpt_every and step % ckpt_every == 0:
+                _save_full(step, epoch)
             if max_steps and step >= max_steps:
                 stop = True
                 break
@@ -503,11 +545,14 @@ def train(cfg, device=None):
     if step > 0:
         _run_eval(step, train_loss=out["loss"].item())
     # always save the final encoder (max_steps/max_minutes stop mid-epoch) so the
-    # trained backbone is available for post-hoc probing / t-SNE / scaling laws.
+    # trained backbone is available for post-hoc probing / t-SNE / scaling laws, plus a
+    # final full checkpoint (resumable) for continuing the run later.
     if is_main(rank):
         save_checkpoint(
             os.path.join(cfg.meta.run_dir, "encoder_final.pt"), raw_encoder, step=step
         )
+        if ckpt_every:
+            _save_full(step, cfg.optim.epochs)
     if is_ddp:
         dist.destroy_process_group()
     return raw_encoder
