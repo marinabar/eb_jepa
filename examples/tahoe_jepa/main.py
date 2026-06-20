@@ -172,37 +172,50 @@ def train(cfg, device=None):
         cell_line_to_organ=maps.get("cell_line_to_organ"),
         sample_to_logconc=maps.get("sample_to_logconc"),
     )
-    # DDP: give each rank a disjoint shard of the data (else all ranks see the same
-    # batches -> no data parallelism). collate_fn (the on-the-fly view generator) is
-    # carried over from the loader init_tahoe_data built.
+    collator = train_loader.collate_fn
+
+    # Held-out probe/eval split (cell-level, seeded): these cells are EXCLUDED from
+    # SSL training so probe metrics measure generalization, not memorization. The
+    # remainder is the SSL training set (a DistributedSampler shards it across ranks).
+    from torch.utils.data import DataLoader, Subset
+
+    eval_enabled = bool(cfg.get("eval", {}).get("enabled", False))
+    n_eval = int(cfg.get("eval", {}).get("eval_cells", 0)) if eval_enabled else 0
+    n_eval = max(0, min(n_eval, len(dataset) - cfg.data.batch_size * max(world, 1)))
+    g_split = torch.Generator().manual_seed(cfg.meta.seed)
+    perm = torch.randperm(len(dataset), generator=g_split).tolist()
+    eval_idx, train_idx = perm[:n_eval], perm[n_eval:]
+    train_subset = Subset(dataset, train_idx)
+
+    loader_kwargs = dict(
+        batch_size=cfg.data.batch_size,
+        num_workers=cfg.data.num_workers,
+        pin_memory=cfg.data.pin_mem,
+        drop_last=True,
+        collate_fn=collator,
+    )
     sampler = None
     if is_ddp:
-        from torch.utils.data import DataLoader, DistributedSampler
+        from torch.utils.data import DistributedSampler
 
         sampler = DistributedSampler(
-            dataset, num_replicas=world, rank=rank, shuffle=True, drop_last=True
+            train_subset, num_replicas=world, rank=rank, shuffle=True, drop_last=True
         )
-        train_loader = DataLoader(
-            dataset,
-            batch_size=cfg.data.batch_size,
-            sampler=sampler,
-            num_workers=cfg.data.num_workers,
-            pin_memory=cfg.data.pin_mem,
-            drop_last=True,
-            collate_fn=train_loader.collate_fn,
-        )
+        train_loader = DataLoader(train_subset, sampler=sampler, **loader_kwargs)
+    else:
+        train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
 
-    # fixed eval set for t-SNE snapshots along training (rank 0 only)
-    eval_batch = eval_labels = tsne_dir = None
-    do_tsne = is_main(rank) and bool(cfg.get("eval", {}).get("enabled", False))
-    if do_tsne:
+    # held-out eval set (rank 0): the excluded cells, one clean full-gene view each
+    eval_batch = eval_labels = eval_dir = None
+    do_eval = is_main(rank) and eval_enabled and n_eval > 0
+    if do_eval:
         from examples.tahoe_jepa.eval_tsne import build_eval_set
 
-        eval_batch, eval_labels = build_eval_set(
-            dataset, data_cfg, int(cfg.eval.get("eval_cells", 2000)), seed=cfg.meta.seed
+        eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
+        eval_dir = os.path.join(cfg.meta.run_dir, "eval")
+        logger.info(
+            f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
         )
-        tsne_dir = os.path.join(cfg.meta.run_dir, "tsne")
-        logger.info(f"t-SNE eval set: {len(eval_labels['organ'])} cells -> {tsne_dir}")
 
     # model
     model = build_train_module(cfg).to(device)
@@ -212,6 +225,8 @@ def train(cfg, device=None):
         model = nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], broadcast_buffers=False
         )
+    raw_module = model.module if is_ddp else model
+    raw_encoder = getattr(raw_module.encoder, "_orig_mod", raw_module.encoder)
 
     # optim
     opt = torch.optim.AdamW(
@@ -240,18 +255,34 @@ def train(cfg, device=None):
             os.environ["WANDB_ENTITY"] = cfg.wandb.entity  # team; key stays in ~/.netrc
         run = setup_wandb(cfg.wandb.project, cfg, cfg.meta.run_dir, enabled=True)
 
-    def _snapshot(step: int):
-        from examples.tahoe_jepa.eval_tsne import tsne_snapshot
+    def _eval(step: int):
+        from examples.tahoe_jepa.eval_tsne import periodic_eval
 
+<<<<<<< Updated upstream
         enc = model.module.encoder if is_ddp else model.encoder
         paths = tsne_snapshot(
             enc, eval_batch, eval_labels, tsne_dir, step, device,
             classes=list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])),
             chunk=int(cfg.eval.get("encode_chunk", 64)),
+=======
+        metrics, path = periodic_eval(
+            raw_encoder,
+            eval_batch,
+            eval_labels,
+            eval_dir,
+            step,
+            device,
+            run=run,
+            classes=list(
+                cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])
+            ),
+            chunk=int(cfg.eval.get("encode_chunk", 128)),
+>>>>>>> Stashed changes
             perplexity=float(cfg.eval.get("perplexity", 30.0)),
             seed=cfg.meta.seed,
             amp=cfg.training.get("amp", True),
         )
+<<<<<<< Updated upstream
         logger.info(f"t-SNE snapshot @ step {step} -> {len(paths)} panels in {tsne_dir}")
         if run is not None:
             import wandb
@@ -291,10 +322,36 @@ def train(cfg, device=None):
         _snapshot(0)  # baseline (random init)
     if probe_every:
         _probe_eval(0)  # baseline (random init)
+=======
+        key = {
+            k: v
+            for k, v in metrics.items()
+            if k.endswith(("balanced_accuracy", "r2", "effective_rank"))
+        }
+        logger.info(
+            f"[eval @ {step}] "
+            + " | ".join(f"{k.split('/', 1)[-1]}={v:.3f}" for k, v in key.items())
+            + f" -> {path}"
+        )
+
+    # eval cadence is the SAME on every rank (so all reach the barrier together);
+    # only rank 0 actually runs the eval.
+    eval_every = (
+        int(
+            cfg.get("eval", {}).get(
+                "eval_every", cfg.get("eval", {}).get("tsne_every", 0)
+            )
+        )
+        if eval_enabled
+        else 0
+    )
+    if do_eval:
+        _eval(0)  # baseline (random init)
+    if is_ddp:
+        dist.barrier()  # other ranks wait for rank 0's baseline eval
+>>>>>>> Stashed changes
 
     # FLOP accounting (trained backbone) + wall-clock budget
-    raw_module = model.module if is_ddp else model
-    raw_encoder = getattr(raw_module.encoder, "_orig_mod", raw_module.encoder)
     n_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
     max_minutes = float(cfg.training.get("max_minutes", 0))
     flops_per_step = None  # global FLOPs/step (fwd+bwd, all ranks); set on first batch
@@ -312,12 +369,18 @@ def train(cfg, device=None):
         for batch in train_loader:
             batch = move_batch(batch, device)
             if flops_per_step is None:
-                fwd = measure_encoder_flops(raw_encoder, batch)
-                flops_per_step = 3.0 * fwd * world  # fwd+bwd (~3x) across all ranks
+                fwd = measure_encoder_flops(raw_encoder, batch)  # per-rank fwd FLOPs
+                global_fwd = fwd
+                if is_ddp:
+                    t = torch.tensor(float(fwd), device=device)
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM)  # literal sum over GPUs
+                    global_fwd = t.item()
+                # fwd+bwd (~3x) summed across all GPUs = global training FLOPs/step
+                flops_per_step = 3.0 * global_fwd
                 if is_main(rank):
                     logger.info(
                         f"encoder fwd FLOPs/rank={fwd:.3e} | "
-                        f"train FLOPs/step (global)={flops_per_step:.3e} | "
+                        f"train FLOPs/step (global sum)={flops_per_step:.3e} | "
                         f"trainable params={n_params:,}"
                     )
                     if run is not None:
@@ -345,16 +408,17 @@ def train(cfg, device=None):
                 elapsed = max(time.time() - loop_start, 1e-9)
                 loss_m = {k: v.detach().item() for k, v in out.items()}
                 lr = sched.get_last_lr()[0]
+                cells_seen = step * cfg.data.batch_size * world
                 metrics = {
                     **loss_m,
                     "lr": lr,
+                    "epoch": epoch,
+                    "data/cells_seen": cells_seen,
+                    "data/tokens_seen": cells_seen * cfg.data.n_views * cfg.data.L,
                     "flops/cumulative": cumulative_flops,
                     "flops/pflops_cumulative": cumulative_flops / 1e15,
                     "flops/tflops_per_s": (cumulative_flops / 1e12) / elapsed,
-                    "throughput/cells_per_s": step
-                    * cfg.data.batch_size
-                    * world
-                    / elapsed,
+                    "throughput/cells_per_s": cells_seen / elapsed,
                 }
                 logger.info(
                     f"step {step} | loss={loss_m['loss']:.4f} "
@@ -365,10 +429,18 @@ def train(cfg, device=None):
                 )
                 if run is not None:
                     run.log(metrics, step=step)
+<<<<<<< Updated upstream
             if tsne_every and step % tsne_every == 0:
                 _snapshot(step)
             if probe_every and step % probe_every == 0:
                 _probe_eval(step)
+=======
+            if eval_every and step % eval_every == 0:
+                if do_eval:  # rank 0 runs probes + t-SNE on the held-out set
+                    _eval(step)
+                if is_ddp:
+                    dist.barrier()  # other ranks wait while rank 0 evaluates
+>>>>>>> Stashed changes
             if max_steps and step >= max_steps:
                 stop = True
                 break
@@ -376,18 +448,23 @@ def train(cfg, device=None):
                 stop = True
                 break
         if is_main(rank) and cfg.training.get("ckpt_every_epoch", True):
-            enc = model.module.encoder if is_ddp else model.encoder
             save_checkpoint(
                 os.path.join(cfg.meta.run_dir, "encoder.pt"),
-                enc,
+                raw_encoder,
                 opt,
                 sched.scheduler,
                 epoch=epoch,
                 step=step,
             )
+    # always save the final encoder (max_steps/max_minutes stop mid-epoch) so the
+    # trained backbone is available for post-hoc probing / t-SNE / scaling laws.
+    if is_main(rank):
+        save_checkpoint(
+            os.path.join(cfg.meta.run_dir, "encoder_final.pt"), raw_encoder, step=step
+        )
     if is_ddp:
         dist.destroy_process_group()
-    return (model.module if is_ddp else model).encoder
+    return raw_encoder
 
 
 def run(config: str = "examples/tahoe_jepa/cfgs/train.yaml", **overrides):

@@ -83,6 +83,87 @@ class TestProbes:
         assert "clf/organ" in results and "reg/gene_count" in results
 
 
+def _eval_cells(n=40):
+    cells = []
+    for i in range(n):
+        gen = torch.Generator().manual_seed(i)
+        g = 6 + i % 5
+        cells.append(
+            {
+                "gene_token_ids": torch.randperm(48, generator=gen)[:g] + 2,
+                "values": torch.rand(g, generator=gen),
+                "drug": "a" if i % 2 else "b",
+                "sample": "s0" if i % 3 else "s1",
+                "cell_line_id": "CVCL_1" if i % 2 else "CVCL_2",
+                "organ": "Liver" if i % 2 else "Lung",
+                "moa_fine": "x" if i % 2 else "y",
+                "canonical_smiles": "CCO",
+                "plate": "p1",
+                "log_conc": -7.0,
+            }
+        )
+    return cells
+
+
+class TestPeriodicEval:
+    def test_build_eval_set_idx(self):
+        from eb_jepa.datasets.tahoe.dataset import TahoeConfig
+        from examples.tahoe_jepa.eval_tsne import build_eval_set
+
+        cells = _eval_cells(10)
+
+        class DS:
+            def __len__(self):
+                return len(cells)
+
+            def __getitem__(self, i):
+                return cells[i]
+
+        cfg = TahoeConfig(data_dir="", L=16, n_views=1, n_genes=50)
+        eb, labels = build_eval_set(DS(), cfg, idx=[1, 3, 5])
+        assert eb["gene_token_ids"].shape[:2] == (1, 3)  # [n_views=1, N=3, L]
+        assert labels["organ"] == [cells[i]["organ"] for i in (1, 3, 5)]
+        assert "sample" in labels
+
+    def test_periodic_eval_probes_and_tsne(self, tmp_path):
+        import os
+
+        from eb_jepa.datasets.tahoe.dataset import TahoeCollator, TahoeConfig
+        from eb_jepa.singlecell.embeddings import GeneTokenEmbedding
+        from eb_jepa.singlecell.encoder import SingleCellEncoder
+        from examples.tahoe_jepa.eval_tsne import periodic_eval
+
+        cells = _eval_cells(40)
+        cfg = TahoeConfig(data_dir="", L=16, n_views=1, n_genes=50, gene_keep_frac=1.0)
+        eval_batch = TahoeCollator(cfg)(cells)
+        labels = {
+            c: [x.get(c) for x in cells]
+            for c in ("organ", "cell_line_id", "drug", "moa_fine", "sample")
+        }
+        enc = SingleCellEncoder(
+            GeneTokenEmbedding.random(50, 32, d_esmc=16, d_evo2=12),
+            d_model=32,
+            n_layers=2,
+            n_heads=4,
+        )
+        metrics, path = periodic_eval(
+            enc,
+            eval_batch,
+            labels,
+            str(tmp_path),
+            step=0,
+            device=torch.device("cpu"),
+            run=None,
+            classes=["organ", "cell_line_id"],
+            chunk=16,
+            perplexity=10.0,
+        )
+        assert any(k.startswith("probe/clf/") for k in metrics)
+        assert "probe/reg/gene_count/r2" in metrics
+        assert "repr/effective_rank" in metrics
+        assert os.path.exists(path)
+
+
 class TestVisualize:
     def test_covariance_spectrum_descending_nonneg(self):
         eig = covariance_spectrum(torch.randn(200, 8))
