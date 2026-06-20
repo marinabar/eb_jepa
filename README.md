@@ -6,8 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="visualizations/sub14_scaling_frontier.png" alt="compute-optimal frontier" width="430">
-  <img src="visualizations/umap/xd_organ.png" alt="UMAP by organ" width="430">
+  <img src="visualizations/sub14_scaling_frontier.png" alt="compute-optimal frontier" width="520">
 </p>
 
 ---
