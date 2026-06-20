@@ -106,6 +106,71 @@ def _palette(n: int):
     return [base[i % len(base)] for i in range(n)]
 
 
+def _draw_tsne_panel(ax, emb2d, labels, name, top_k=14, point_size=7.0):
+    """Draw one class colouring onto ``ax`` (design system). Shared by grid/single."""
+    import collections
+
+    labels = list(labels)
+    freq = collections.Counter(x for x in labels if x is not None)
+    shown = [c for c, _ in freq.most_common(top_k)]
+    cmap = {c: col for c, col in zip(shown, _palette(len(shown)))}
+    is_other = np.array([x not in cmap for x in labels])
+    if is_other.any():
+        ax.scatter(
+            emb2d[is_other, 0], emb2d[is_other, 1],
+            s=point_size * 0.7, c=_OTHER, linewidths=0, alpha=0.55, zorder=1,
+        )
+    for c in shown:
+        m = np.array([x == c for x in labels])
+        ax.scatter(
+            emb2d[m, 0], emb2d[m, 1],
+            s=point_size, color=cmap[c], linewidths=0, alpha=0.85, zorder=2,
+            label=str(c),
+        )
+    n_cat = len(freq)
+    ax.set_title(name, loc="left", fontsize=14, fontweight="bold", color=_INK, pad=10)
+    ax.text(
+        0.0, 1.005,
+        f"{n_cat} categories" + (f"  ·  top {top_k} shown" if n_cat > top_k else ""),
+        transform=ax.transAxes, fontsize=8.5, color=_SUB,
+    )
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color("#c7cfdb"); s.set_linewidth(0.8)
+    ax.set_aspect("equal", adjustable="datalim")
+    leg = ax.legend(
+        markerscale=2.2, fontsize=7.5, loc="upper right", frameon=False,
+        handletextpad=0.3, labelspacing=0.3, ncol=1, borderaxespad=0.2,
+    )
+    for t in leg.get_texts():
+        t.set_color(_INK)
+
+
+def plot_tsne_single(
+    emb2d, labels, path: str, name: str, step: int | None = None,
+    top_k: int = 14, point_size: float = 8.0,
+):
+    """Elegant single-class t-SNE scatter; one image per coloring. Returns path."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    emb2d = np.asarray(emb2d)
+    fig, ax = plt.subplots(figsize=(8.0, 7.2), facecolor="white")
+    _draw_tsne_panel(ax, emb2d, labels, name, top_k=top_k, point_size=point_size)
+    suptitle = f"t-SNE · {name}"
+    if step is not None:
+        suptitle += f"  ·  step {step}"
+    fig.suptitle(
+        suptitle, x=0.02, y=0.99, ha="left", fontsize=16, fontweight="bold", color=_INK
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return path
+
+
 def plot_tsne_grid(
     emb2d,
     labels_by_class: dict,
@@ -120,8 +185,6 @@ def plot_tsne_grid(
     show the ``top_k`` most frequent categories in colour; the rest (and ``None``)
     are drawn as faint grey "other". Returns ``path``.
     """
-    import collections
-
     import matplotlib
 
     matplotlib.use("Agg")
@@ -137,43 +200,7 @@ def plot_tsne_grid(
     axes = np.atleast_1d(axes).ravel()
 
     for ax, name in zip(axes, names):
-        labels = list(labels_by_class[name])
-        freq = collections.Counter(x for x in labels if x is not None)
-        shown = [c for c, _ in freq.most_common(top_k)]
-        cmap = {c: col for c, col in zip(shown, _palette(len(shown)))}
-        is_other = np.array([x not in cmap for x in labels])
-        if is_other.any():
-            ax.scatter(
-                emb2d[is_other, 0], emb2d[is_other, 1],
-                s=point_size * 0.7, c=_OTHER, linewidths=0, alpha=0.55, zorder=1,
-            )
-        for c in shown:
-            m = np.array([x == c for x in labels])
-            ax.scatter(
-                emb2d[m, 0], emb2d[m, 1],
-                s=point_size, color=cmap[c], linewidths=0, alpha=0.85, zorder=2,
-                label=str(c),
-            )
-        n_cat = len(freq)
-        ax.set_title(
-            f"{name}", loc="left", fontsize=14, fontweight="bold", color=_INK, pad=10
-        )
-        ax.text(
-            0.0, 1.005,
-            f"{n_cat} categories" + (f"  ·  top {top_k} shown" if n_cat > top_k else ""),
-            transform=ax.transAxes, fontsize=8.5, color=_SUB,
-        )
-        ax.set_xticks([]); ax.set_yticks([])
-        for s in ax.spines.values():
-            s.set_color("#c7cfdb"); s.set_linewidth(0.8)
-        ax.set_aspect("equal", adjustable="datalim")
-        leg = ax.legend(
-            markerscale=2.2, fontsize=7.5, loc="upper right", frameon=False,
-            handletextpad=0.3, labelspacing=0.3, ncol=1, borderaxespad=0.2,
-        )
-        for t in leg.get_texts():
-            t.set_color(_INK)
-
+        _draw_tsne_panel(ax, emb2d, labels_by_class[name], name, top_k, point_size)
     for ax in axes[len(names):]:
         ax.axis("off")
 
