@@ -15,6 +15,7 @@ import os
 import pickle
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import torch
 
 from eb_jepa.datasets.tahoe.dataset import (
@@ -22,6 +23,9 @@ from eb_jepa.datasets.tahoe.dataset import (
     TahoeIterableDataset,
     densify,
 )
+
+# Index space = max Tahoe token_id (62712) + 1.
+N_GENES_INDEX = 62713
 
 if TYPE_CHECKING:
     from eb_jepa.singlecell.baselines import (
@@ -89,6 +93,48 @@ def densify_items(items: list[dict], n_genes: int) -> torch.Tensor:
     return torch.stack(
         [densify(c["gene_token_ids"], c["values"], n_genes) for c in items]
     )
+
+
+# --------------------------------------------------------------------------- #
+# HVG-restricted dense input (MATCHED baselines)                              #
+# --------------------------------------------------------------------------- #
+def load_hvg_panel(hvg_path: str) -> torch.Tensor:
+    """Load the saved HVG panel (``hvg_{N}.npy``) as a sorted int64 token_id tensor."""
+    panel = np.load(hvg_path)
+    return torch.from_numpy(np.asarray(panel, dtype=np.int64))
+
+
+def build_hvg_local_map(
+    panel: torch.Tensor, n_index: int = N_GENES_INDEX
+) -> torch.Tensor:
+    """Map raw token_id -> local HVG column (size ``n_index``, -1 for off-panel genes).
+
+    ``panel`` is the sorted list of the N selected token_ids; local column j holds
+    ``panel[j]``. Genes outside the panel map to -1 and are dropped at densify time.
+    """
+    local = torch.full((n_index,), -1, dtype=torch.long)
+    local[panel.long()] = torch.arange(panel.numel(), dtype=torch.long)
+    return local
+
+
+def densify_hvg(
+    items: list[dict], hvg_local_map: torch.Tensor, n_hvg: int
+) -> torch.Tensor:
+    """Stack the cells into the dense [N, n_hvg] HVG-panel matrix.
+
+    Each cell's sparse (token_id, value) pairs are scattered into the n_hvg-wide
+    vector via ``hvg_local_map``; off-panel genes (local index -1) are dropped.
+    """
+    out = torch.zeros((len(items), int(n_hvg)), dtype=torch.float32)
+    for j, c in enumerate(items):
+        tok = c["gene_token_ids"].long()
+        if tok.numel() == 0:
+            continue
+        local = hvg_local_map[tok]  # [-1 for off-panel]
+        keep = local >= 0
+        if keep.any():
+            out[j, local[keep]] = c["values"].to(torch.float32)[keep]
+    return out
 
 
 # --------------------------------------------------------------------------- #

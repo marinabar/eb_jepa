@@ -1,0 +1,63 @@
+# MATCHED VAE baseline — fair head-to-head with Subliminal-14-small (Dalia 1 GPU).
+#
+# Matches sub14_small on THREE axes at once:
+#   - representation width : latent = 256                (== sub14 pre-proj rep dim)
+#   - context window       : 512 genes/cell             (== sub14 num_bins*genes_per_bin = 16*32)
+#   - trainable params     : ~3.62 M                     (sub14_small = 3,616,648)
+#
+# The dense input is restricted to a FIXED panel of the top-512 highly-variable
+# genes (data.hvg_path); the model n_genes therefore becomes 512. hidden is sized
+# to hit the param target:
+#   VAE = _mlp([512,H,H]) + to_mu(H->256) + to_logvar(H->256) + _mlp([256,H,512])
+#       = H^2 + 1795*H + 1024.
+#   H = 1205 -> 1205^2 + 1795*1205 + 1024 = 3,616,024 params  (dev -0.017% vs 3,616,648).
+#
+# Launch (1 GPU):
+#   /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python -m examples.tahoe_baselines.train \
+#       run --config examples/tahoe_baselines/cfgs/vae_matched.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/baselines_matched/vae
+
+model:
+  type: vae
+  hidden: 1205          # -> 3,616,024 trainable params (~3.62M, matched)
+  latent: 256           # == sub14_small representation dim
+  kl_coeff: 1.0e-3      # sweep {1e-4, 1e-3, 1e-2} for the well-tuned comparison
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 256
+  num_workers: 6
+  pin_mem: true
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  hvg_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/hvg_512.npy   # 512-gene panel
+  n_genes: 62713        # ignored when hvg_path is set (input width becomes the panel size)
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  max_grad_norm: 1.0
+  max_steps: 4000
+  max_minutes: 45
+
+training:
+  native_bf16: true
+  log_every: 25
+  ckpt_every_steps: 1000
+
+eval:
+  enabled: true
+  eval_every: 1000
+  eval_cells: 1024
+  encode_chunk: 256
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

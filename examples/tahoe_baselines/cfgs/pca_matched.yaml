@@ -1,0 +1,45 @@
+# MATCHED PCA baseline — fair head-to-head with Subliminal-14-small (Dalia/CPU).
+#
+# Matches sub14_small's representation width (n_components = 256) and context
+# window (512 highly-variable genes via data.hvg_path). PCA has NO trainable
+# parameters, so the param-count axis does not apply; n_components = 256 on the
+# 512-HVG input is the honest LINEAR floor at the matched width/context.
+#
+# Launch (CPU is fine):
+#   /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python -m examples.tahoe_baselines.train \
+#       run --config examples/tahoe_baselines/cfgs/pca_matched.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/baselines_matched/pca
+
+model:
+  type: pca
+  n_components: 256     # == sub14_small representation dim
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 256
+  num_workers: 6
+  pin_mem: false
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  hvg_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/hvg_512.npy   # 512-gene panel
+  n_genes: 62713        # ignored when hvg_path is set (input width becomes the panel size)
+
+optim:
+  fit_cells: 50000
+
+training:
+  native_bf16: false   # PCA runs in fp32 on CPU (sklearn)
+
+eval:
+  enabled: true
+  eval_cells: 1024
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

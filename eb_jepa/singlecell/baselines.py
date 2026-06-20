@@ -15,6 +15,18 @@ import torch.nn.functional as F
 
 from eb_jepa.datasets.tahoe.dataset import densify
 
+_META_KEYS = ("drug", "sample", "cell_line_id", "organ", "moa_fine", "plate")
+
+
+def _meta_out(dense: torch.Tensor, batch: list[dict]) -> dict:
+    out: dict = {"dense": dense}
+    for k in _META_KEYS:
+        out[k] = [c.get(k) for c in batch]
+    out["log_conc"] = torch.tensor(
+        [c.get("log_conc", float("nan")) for c in batch], dtype=torch.float32
+    )
+    return out
+
 
 class DensifyCollator:
     """Collate sparse cells into dense [N, n_genes] vectors + probing metadata."""
@@ -26,14 +38,33 @@ class DensifyCollator:
         dense = torch.stack(
             [densify(c["gene_token_ids"], c["values"], self.n_genes) for c in batch]
         )
-        meta_keys = ("drug", "sample", "cell_line_id", "organ", "moa_fine", "plate")
-        out: dict = {"dense": dense}
-        for k in meta_keys:
-            out[k] = [c.get(k) for c in batch]
-        out["log_conc"] = torch.tensor(
-            [c.get("log_conc", float("nan")) for c in batch], dtype=torch.float32
-        )
-        return out
+        return _meta_out(dense, batch)
+
+
+class HVGDensifyCollator:
+    """Collate sparse cells into the dense [N, n_hvg] HVG-panel vector + metadata.
+
+    Restricts the dense input to a FIXED panel of N highly-variable genes so the
+    MATCHED baselines share Subliminal-14's context-window size (genes per cell).
+    ``hvg_local_map`` (size = token-id index space, -1 for off-panel genes) maps each
+    raw token_id to its local panel column; off-panel genes are dropped.
+    """
+
+    def __init__(self, hvg_local_map: torch.Tensor, n_hvg: int):
+        self.hvg_local_map = hvg_local_map.long()
+        self.n_hvg = int(n_hvg)
+
+    def __call__(self, batch: list[dict]) -> dict:
+        dense = torch.zeros((len(batch), self.n_hvg), dtype=torch.float32)
+        for j, c in enumerate(batch):
+            tok = c["gene_token_ids"].long()
+            if tok.numel() == 0:
+                continue
+            local = self.hvg_local_map[tok]
+            keep = local >= 0
+            if keep.any():
+                dense[j, local[keep]] = c["values"].to(torch.float32)[keep]
+        return _meta_out(dense, batch)
 
 
 def _mlp(sizes, act=nn.GELU):

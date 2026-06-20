@@ -21,6 +21,19 @@ Usage (Dalia, single GPU):
         --vae_ckpt /.../runs/baselines/vae/encoder_final.pt \
         --pca_ckpt /.../runs/baselines/pca/pca.pkl \
         --eval_cells 3000 --out_dir visualizations/benchmarks
+
+The MATCHED baselines (same width/context/params as sub14_small) are passed via the
+``*_matched_ckpt`` flags together with ``--hvg_path``; they appear as MAE-512 /
+VAE-512 / PCA-512 in the table and can be combined with the full-vocab ckpts in a
+single run, or run matched-only:
+    python -m examples.tahoe_baselines.benchmark run \
+        --sub14_config examples/tahoe_jepa/cfgs/sub14_small.yaml \
+        --sub14_ckpt   /.../runs/sub14/sub14_small/encoder_frozen_pert.pt \
+        --hvg_path /lustre/work/vivatech-unaite/shared/tahoe-cache/hvg_512.npy \
+        --mae_matched_ckpt /.../runs/baselines_matched/mae/encoder_final.pt \
+        --vae_matched_ckpt /.../runs/baselines_matched/vae/encoder_final.pt \
+        --pca_matched_ckpt /.../runs/baselines_matched/pca/pca.pkl \
+        --eval_cells 3000 --out_dir visualizations/benchmarks
 """
 from __future__ import annotations
 
@@ -37,13 +50,16 @@ from eb_jepa.singlecell.visualize import effective_rank
 from eb_jepa.training_utils import load_config, setup_wandb
 
 from examples.tahoe_baselines.common import (
+    build_hvg_local_map,
     build_stream,
+    densify_hvg,
     densify_items,
     encode_baseline,
     encode_sub14,
     eval_meta,
     fixed_eval_items,
     load_baseline_checkpoint,
+    load_hvg_panel,
     load_sub14_checkpoint,
 )
 
@@ -117,20 +133,48 @@ def scib_metrics(reps: torch.Tensor, meta: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Encode each model on the SAME fixed cells                                   #
 # --------------------------------------------------------------------------- #
-def encode_all(items, *, sub14_config, sub14_ckpt, mae_ckpt, vae_ckpt, pca_ckpt,
-               n_genes, device, encode_chunk):
-    """Return {model_name -> features [N, d]} encoded on the identical eval cells."""
-    feats: dict = {}
-
-    # Baselines (densified vector)
-    dense = densify_items(items, n_genes)
-    for name, ckpt in (("MAE", mae_ckpt), ("VAE", vae_ckpt), ("PCA", pca_ckpt)):
+def _encode_baselines(items, ckpts, dense, device, encode_chunk, feats):
+    """Encode each available baseline ckpt on the given dense matrix into ``feats``."""
+    for name, ckpt in ckpts:
         if ckpt and os.path.exists(ckpt):
             model = load_baseline_checkpoint(ckpt, device)
             feats[name] = encode_baseline(model, dense, device, chunk=encode_chunk)
             logger.info(f"encoded {name}: {tuple(feats[name].shape)}")
         else:
             logger.warning(f"{name} checkpoint missing ({ckpt}) — skipping.")
+
+
+def encode_all(items, *, sub14_config, sub14_ckpt, mae_ckpt, vae_ckpt, pca_ckpt,
+               mae_matched_ckpt, vae_matched_ckpt, pca_matched_ckpt, hvg_path,
+               n_genes, device, encode_chunk):
+    """Return {model_name -> features [N, d]} encoded on the identical eval cells.
+
+    Full-vocab baselines (MAE/VAE/PCA) consume the 62,713-gene densified vector;
+    the MATCHED baselines (MAE-512/VAE-512/PCA-512) consume the fixed N-HVG-panel
+    densified vector when ``hvg_path`` is given. Both run on the SAME eval cells.
+    """
+    feats: dict = {}
+
+    # Full-vocab baselines (densified 62,713 vector)
+    dense = densify_items(items, n_genes)
+    _encode_baselines(
+        items, (("MAE", mae_ckpt), ("VAE", vae_ckpt), ("PCA", pca_ckpt)),
+        dense, device, encode_chunk, feats,
+    )
+
+    # Matched baselines (densified fixed HVG panel)
+    matched = ((f"MAE-{{n}}", mae_matched_ckpt), (f"VAE-{{n}}", vae_matched_ckpt),
+               (f"PCA-{{n}}", pca_matched_ckpt))
+    if hvg_path and any(c for _, c in matched):
+        panel = load_hvg_panel(hvg_path)
+        n_hvg = int(panel.numel())
+        dense_hvg = densify_hvg(items, build_hvg_local_map(panel), n_hvg)
+        _encode_baselines(
+            items, [(t.format(n=n_hvg), c) for t, c in matched],
+            dense_hvg, device, encode_chunk, feats,
+        )
+    elif any(c for _, c in matched):
+        logger.warning("matched ckpts given but no hvg_path — skipping matched baselines.")
 
     # Subliminal-14 (PC quantile-thermometer views)
     if sub14_ckpt and os.path.exists(sub14_ckpt):
@@ -181,6 +225,10 @@ def run(
     mae_ckpt: str = "",
     vae_ckpt: str = "",
     pca_ckpt: str = "",
+    mae_matched_ckpt: str = "",
+    vae_matched_ckpt: str = "",
+    pca_matched_ckpt: str = "",
+    hvg_path: str = "",
     data_config: str = "examples/tahoe_baselines/cfgs/mae.yaml",
     eval_cells: int = 3000,
     n_genes: int = 62713,
@@ -203,6 +251,8 @@ def run(
     feats = encode_all(
         items, sub14_config=sub14_config, sub14_ckpt=sub14_ckpt,
         mae_ckpt=mae_ckpt, vae_ckpt=vae_ckpt, pca_ckpt=pca_ckpt,
+        mae_matched_ckpt=mae_matched_ckpt, vae_matched_ckpt=vae_matched_ckpt,
+        pca_matched_ckpt=pca_matched_ckpt, hvg_path=hvg_path,
         n_genes=n_genes, device=device, encode_chunk=encode_chunk,
     )
     if not feats:

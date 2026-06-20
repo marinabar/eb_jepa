@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from eb_jepa.logging import get_logger
 from eb_jepa.singlecell.baselines import (
     DensifyCollator,
+    HVGDensifyCollator,
     PCABaseline,
     build_baseline,
 )
@@ -37,10 +38,13 @@ from eb_jepa.singlecell.visualize import effective_rank
 from eb_jepa.training_utils import load_config, setup_seed, setup_wandb
 
 from examples.tahoe_baselines.common import (
+    build_hvg_local_map,
     build_stream,
+    densify_hvg,
     densify_items,
     eval_meta,
     fixed_eval_items,
+    load_hvg_panel,
 )
 
 logger = get_logger(__name__)
@@ -49,9 +53,25 @@ logger = get_logger(__name__)
 # --------------------------------------------------------------------------- #
 # Build                                                                       #
 # --------------------------------------------------------------------------- #
-def build_loader(cfg):
+def resolve_input(cfg):
+    """Resolve the dense input: full-vocab vs. HVG-restricted (MATCHED baselines).
+
+    Returns ``(input_dim, collator, hvg_local_map)``. When ``data.hvg_path`` is set
+    the input is the fixed N-gene HVG panel (``input_dim = N``, the matched context
+    window); otherwise it is the full 62,713-gene vocabulary.
+    """
+    hvg_path = cfg.data.get("hvg_path", "")
+    if hvg_path:
+        panel = load_hvg_panel(hvg_path)
+        hvg_local = build_hvg_local_map(panel)
+        n_hvg = int(panel.numel())
+        logger.info(f"HVG panel: {n_hvg} genes from {hvg_path}")
+        return n_hvg, HVGDensifyCollator(hvg_local, n_hvg), hvg_local
+    return int(cfg.data.n_genes), DensifyCollator(int(cfg.data.n_genes)), None
+
+
+def build_loader(cfg, collator):
     dataset = build_stream(cfg, shuffle=True)
-    collator = DensifyCollator(int(cfg.data.n_genes))
     loader = DataLoader(
         dataset,
         batch_size=int(cfg.data.batch_size),
@@ -64,13 +84,19 @@ def build_loader(cfg):
     return loader, dataset
 
 
-def build_eval(cfg, dataset):
-    """Fixed shared eval set: dense matrix + probe metadata (rank-0 / single GPU)."""
+def build_eval(cfg, dataset, input_dim, hvg_local):
+    """Fixed shared eval set: dense matrix + probe metadata (rank-0 / single GPU).
+
+    Densifies onto the same input space the model trains on (HVG panel when set).
+    """
     n_eval = int(cfg.eval.get("eval_cells", 0))
     if not (cfg.eval.get("enabled", False) and n_eval > 0):
         return None, None
     items = fixed_eval_items(dataset, n_eval)
-    dense = densify_items(items, int(cfg.data.n_genes))
+    if hvg_local is not None:
+        dense = densify_hvg(items, hvg_local, input_dim)
+    else:
+        dense = densify_items(items, input_dim)
     return dense, eval_meta(items)
 
 
@@ -108,7 +134,8 @@ def _log_probes(run, metrics, step):
 # PCA (no iterative training)                                                 #
 # --------------------------------------------------------------------------- #
 def fit_pca(cfg, device):
-    loader, dataset = build_loader(cfg)
+    input_dim, collator, hvg_local = resolve_input(cfg)
+    loader, dataset = build_loader(cfg, collator)
     n_fit = int(cfg.optim.get("fit_cells", 50000))
     rows, seen = [], 0
     for batch in loader:
@@ -128,7 +155,7 @@ def fit_pca(cfg, device):
     logger.info(f"  -> saved {out}")
 
     run = _maybe_wandb(cfg)
-    dense, meta = build_eval(cfg, dataset)
+    dense, meta = build_eval(cfg, dataset, input_dim, hvg_local)
     if dense is not None and model._pca is not None:
         ev = float(model._pca.explained_variance_ratio_.sum())
         metrics = probe_snapshot(model, dense, meta, device, chunk=512)
@@ -155,14 +182,15 @@ def train_neural(cfg, device):
     native_bf16 = bool(cfg.training.get("native_bf16", False)) and device.type == "cuda"
     train_dtype = torch.bfloat16 if native_bf16 else torch.float32
 
-    loader, dataset = build_loader(cfg)
+    input_dim, collator, hvg_local = resolve_input(cfg)
+    loader, dataset = build_loader(cfg, collator)
     mtype = str(cfg.model.type)
     kw: dict = dict(hidden=int(cfg.model.hidden), latent=int(cfg.model.latent))
     if mtype == "mae":
         kw["mask_frac"] = float(cfg.model.get("mask_frac", 0.5))
     elif mtype == "vae":
         kw["kl_coeff"] = float(cfg.model.get("kl_coeff", 1e-3))
-    model = build_baseline(mtype, int(cfg.data.n_genes), **kw)
+    model = build_baseline(mtype, input_dim, **kw)
     assert isinstance(model, torch.nn.Module)  # mae/vae only (pca uses fit_pca)
     model = model.to(device=device, dtype=train_dtype)
 
@@ -182,15 +210,15 @@ def train_neural(cfg, device):
     logger.info(f"{mtype.upper()} trainable params: {n_params:,} | dtype={train_dtype}")
 
     run = _maybe_wandb(cfg)
-    dense, meta = build_eval(cfg, dataset)
+    dense, meta = build_eval(cfg, dataset, input_dim, hvg_local)
     encode_chunk = int(cfg.eval.get("encode_chunk", 256))
 
     def _save(step, tag):
         os.makedirs(cfg.meta.run_dir, exist_ok=True)
         path = os.path.join(cfg.meta.run_dir, f"{tag}.pt")
         torch.save(
-            {"model": model.state_dict(), "type": mtype, "n_genes": int(cfg.data.n_genes),
-             "kwargs": kw, "step": step},
+            {"model": model.state_dict(), "type": mtype, "n_genes": int(input_dim),
+             "hvg_path": cfg.data.get("hvg_path", ""), "kwargs": kw, "step": step},
             path,
         )
         logger.info(f"  -> saved {tag}.pt @ step {step}")

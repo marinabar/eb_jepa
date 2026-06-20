@@ -4,6 +4,7 @@ import torch
 
 from eb_jepa.singlecell.baselines import (
     DensifyCollator,
+    HVGDensifyCollator,
     MAEBaseline,
     PCABaseline,
     VAEBaseline,
@@ -126,6 +127,82 @@ def test_pca_encode_after_fit_shapes():
     pca = PCABaseline(n_components=8).fit(dense)
     z = pca.encode(dense)
     assert z.shape == (40, 8) and torch.is_tensor(z)
+
+
+# --------------------------------------------------------------------------- #
+# MATCHED baselines: ~3.62M trainable params at the configured H (sub14_small)  #
+# --------------------------------------------------------------------------- #
+SUB14_SMALL_PARAMS = 3_616_648
+MATCHED_N_HVG = 512
+MATCHED_LATENT = 256
+# These H values come straight from cfgs/{mae,vae}_matched.yaml.
+MAE_MATCHED_HIDDEN = 2351
+VAE_MATCHED_HIDDEN = 1205
+
+
+def _trainable(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def test_mae_matched_param_count():
+    mae = MAEBaseline(MATCHED_N_HVG, hidden=MAE_MATCHED_HIDDEN, latent=MATCHED_LATENT)
+    n = _trainable(mae)
+    # closed form: _mlp([512,H,256]) + _mlp([256,H,512]) = 1538*H + 768
+    assert n == 1538 * MAE_MATCHED_HIDDEN + 768
+    assert abs(n - SUB14_SMALL_PARAMS) / SUB14_SMALL_PARAMS <= 0.05
+
+
+def test_vae_matched_param_count():
+    vae = VAEBaseline(MATCHED_N_HVG, hidden=VAE_MATCHED_HIDDEN, latent=MATCHED_LATENT)
+    n = _trainable(vae)
+    # closed form: H^2 + 1795*H + 1024
+    assert n == VAE_MATCHED_HIDDEN ** 2 + 1795 * VAE_MATCHED_HIDDEN + 1024
+    assert abs(n - SUB14_SMALL_PARAMS) / SUB14_SMALL_PARAMS <= 0.05
+
+
+# --------------------------------------------------------------------------- #
+# HVG-restricted densify: correct scatter + off-panel genes dropped           #
+# --------------------------------------------------------------------------- #
+def test_hvg_densify_scatter_and_drop():
+    from examples.tahoe_baselines.common import build_hvg_local_map, densify_hvg
+
+    n_index = 20
+    panel = torch.tensor([3, 7, 11, 15], dtype=torch.long)  # sorted token_ids
+    local = build_hvg_local_map(panel, n_index=n_index)
+    assert local.shape == (n_index,)
+    assert local[3] == 0 and local[7] == 1 and local[11] == 2 and local[15] == 3
+    assert local[0] == -1 and local[8] == -1  # off-panel -> -1
+
+    items = [
+        # token 7 (col 1) -> 0.5, token 15 (col 3) -> 0.9, token 8 OFF-PANEL -> dropped
+        {"gene_token_ids": torch.tensor([7, 15, 8]),
+         "values": torch.tensor([0.5, 0.9, 7.0])},
+        # token 3 (col 0) -> 0.2 only
+        {"gene_token_ids": torch.tensor([3]), "values": torch.tensor([0.2])},
+    ]
+    dense = densify_hvg(items, local, panel.numel())
+    assert dense.shape == (2, 4)
+    expected = torch.tensor([[0.0, 0.5, 0.0, 0.9], [0.2, 0.0, 0.0, 0.0]])
+    assert torch.allclose(dense, expected)
+    # the off-panel token (8, value 7.0) must NOT appear anywhere
+    assert (dense == 7.0).sum() == 0
+
+
+def test_hvg_collator_matches_densify():
+    from examples.tahoe_baselines.common import build_hvg_local_map, densify_hvg
+
+    n_index = 64
+    panel = torch.tensor([5, 9, 20, 33, 50], dtype=torch.long)
+    local = build_hvg_local_map(panel, n_index=n_index)
+    cells = _cells(8)
+    # restrict synthetic cells' token ids into the index space
+    for c in cells:
+        c["gene_token_ids"] = c["gene_token_ids"] % n_index
+    coll = HVGDensifyCollator(local, panel.numel())
+    out = coll(cells)
+    assert out["dense"].shape == (8, panel.numel())
+    assert torch.allclose(out["dense"], densify_hvg(cells, local, panel.numel()))
+    assert len(out["organ"]) == 8 and out["log_conc"].shape == (8,)
 
 
 # --------------------------------------------------------------------------- #
