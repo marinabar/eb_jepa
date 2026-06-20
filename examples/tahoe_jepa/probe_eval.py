@@ -79,7 +79,6 @@ def _flatten_probe_results(results: dict) -> dict[str, float]:
             name = full_key[len("clf/") :]
             ba = float(m.get("balanced_accuracy", float("nan")))
             chance = float(m.get("chance", float("nan")))
-            scalars[f"probe/clf/{name}/loss"] = float(m.get("loss", float("nan")))
             scalars[f"probe/clf/{name}/balanced_accuracy"] = ba
             scalars[f"probe/clf/{name}/macro_f1"] = float(
                 m.get("macro_f1", float("nan"))
@@ -126,9 +125,7 @@ def probe_report(
     total = float(eig.sum())
     scalars["repr/effective_rank"] = effective_rank(feats)
     scalars["repr/effrank_ratio"] = scalars["repr/effective_rank"] / max(1, d)
-    scalars["repr/top1_eig_frac"] = (
-        float(eig[0]) / total if total > 0 else float("nan")
-    )
+    scalars["repr/top1_eig_frac"] = float(eig[0]) / total if total > 0 else float("nan")
 
     os.makedirs(out_dir, exist_ok=True)
     spectrum_path = os.path.join(out_dir, f"spectrum_step{step:06d}.png")

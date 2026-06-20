@@ -32,14 +32,11 @@ def _separable(n_per=40, n_classes=3, d=8, noise=0.3, seed=0):
 
 class TestProbes:
     def test_classification_beats_chance(self):
-        import math
-
         feats, labels = _separable(n_per=100, noise=0.2)
         m = train_classification_probe(feats, labels)
         assert m["n_classes"] == 3
-        # 1-epoch linear probe (fixed init): held-out loss below random + above chance
-        assert m["loss"] < math.log(3)
-        assert m["balanced_accuracy"] > m["chance"]
+        assert m["balanced_accuracy"] > 0.7 > m["chance"]
+        assert m["macro_f1"] > 0.7
 
     def test_classification_ignores_none_labels(self):
         feats, labels = _separable(n_per=40, n_classes=2)
@@ -53,8 +50,28 @@ class TestProbes:
         w = torch.randn(8)
         target = feats @ w + 0.05 * torch.randn(400)
         m = train_regression_probe(feats, target)
-        # 1-epoch linear probe: held-out MSE below the predict-the-mean baseline (1.0)
-        assert m["loss"] < 1.0 and m["r2"] > 0.0
+        assert m["r2"] > 0.8 and m["loss"] < 0.5
+
+    def test_probes_sane_at_random_init(self):
+        # CRITICAL: on a no-signal (random) representation the probes must give the
+        # trivial baseline, never worse. clf ~ chance; reg r2 ~ 0 (NOT << 0).
+        torch.manual_seed(0)
+        feats = torch.randn(300, 32)  # random "representation", no signal
+        labels = [f"c{i % 5}" for i in range(300)]  # 5 classes, unrelated to feats
+        target = torch.randn(300)  # target unrelated to feats
+        mc = train_classification_probe(feats, labels)
+        mr = train_regression_probe(feats, target)
+        assert abs(mc["balanced_accuracy"] - mc["chance"]) < 0.12  # ~ chance (0.2)
+        assert -0.3 < mr["r2"] < 0.3  # ~ 0, never catastrophically negative
+
+    def test_regression_collapsed_features_not_catastrophic(self):
+        # rank-1 (collapsed) features + arbitrary target: r2 must stay ~0, not -16.
+        torch.manual_seed(0)
+        base = torch.randn(300, 1)
+        feats = base @ torch.randn(1, 64)  # rank-1
+        target = torch.randn(300)
+        m = train_regression_probe(feats, target)
+        assert m["r2"] > -0.3
 
     def test_extract_features_and_suite(self):
         cfg = TahoeConfig(data_dir="", L=16, n_views=1, n_genes=50, gene_keep_frac=1.0)

@@ -74,69 +74,52 @@ def _split(n: int, val_frac: float, seed: int):
     return perm[n_val:], perm[:n_val]  # (train_idx, val_idx)
 
 
-def _linear_probe_1epoch(X, y, n_out, task, seed=0, lr=5e-2, batch_size=16):
-    """Fit a fresh linear probe for exactly ONE epoch on a train split of the eval
-    features, from a FIXED seed initialisation (identical every eval -> probe losses
-    are directly comparable across evals and scales; no continuous/accumulated
-    training). Features standardized (deterministic). Returns (val_loss, val_out,
-    val_targets). task: 'clf' (cross-entropy) or 'reg' (MSE)."""
+_ALPHAS = (0.1, 1.0, 10.0, 100.0, 1000.0)
+
+
+def _standardize(X, tr):
+    """Center (per-dim, train stats) + scale by a SINGLE GLOBAL scalar, then numpy.
+
+    Crucially NOT per-dim sd: dividing by a near-zero per-dim sd amplifies collapsed
+    (zero-variance) dimensions and makes the probe explode (r2 << 0). A single global
+    scale keeps collapsed dims small so the ridge simply ignores them.
+    """
     X = X.float()
-    mu = X.mean(0, keepdim=True)
-    sd = X.std(0, keepdim=True).clamp(min=1e-6)
-    X = (X - mu) / sd
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(X.shape[0], generator=g)
-    n_val = max(1, int(0.2 * X.shape[0]))
-    vi, ti = perm[:n_val], perm[n_val:]
-    Xtr, ytr, Xva, yva = X[ti], y[ti], X[vi], y[vi]
-    torch.manual_seed(seed)  # SAME probe initialisation at every eval
-    probe = nn.Linear(X.shape[1], n_out)
-    opt = torch.optim.Adam(probe.parameters(), lr=lr)
-    ce = task == "clf"
-
-    def _loss(out, tgt):
-        return (
-            nn.functional.cross_entropy(out, tgt)
-            if ce
-            else nn.functional.mse_loss(out.squeeze(-1), tgt)
-        )
-
-    order = torch.randperm(Xtr.shape[0], generator=g)
-    for s in range(0, Xtr.shape[0], batch_size):  # exactly one epoch
-        b = order[s : s + batch_size]
-        opt.zero_grad()
-        _loss(probe(Xtr[b]), ytr[b]).backward()
-        opt.step()
-    with torch.no_grad():
-        vout = probe(Xva)
-        vloss = float(_loss(vout, yva))
-    return vloss, vout, yva
+    mu = X[tr].mean(0, keepdim=True)
+    s = (X[tr] - mu).std().clamp(min=1e-6)
+    return ((X - mu) / s).numpy()
 
 
 def train_classification_probe(features: torch.Tensor, labels: list, seed: int = 0):
-    """1-epoch-from-scratch linear probe (fixed init); report the held-out probe
-    **loss** (cross-entropy) + imbalance-aware accuracy. Cheap and comparable across
-    evals (refit each eval, never accumulated)."""
+    """Closed-form ridge classifier (RidgeClassifierCV: ridge on one-hot, LOO-selected
+    alpha), refit from scratch each eval. Stable + sane at init (-> chance), no SGD /
+    training-budget bias, fast (no lbfgs). Imbalance-aware metrics on a holdout."""
+    from sklearn.linear_model import RidgeClassifierCV
     from sklearn.metrics import balanced_accuracy_score, f1_score
 
     ids, classes = _labels_to_ids(labels)
     keep = ids >= 0
-    X, y = features[keep], ids[keep]
+    X, y = features[keep], ids[keep].numpy()
     n_classes = len(classes)
+    nan = {
+        "n_classes": n_classes,
+        "balanced_accuracy": float("nan"),
+        "macro_f1": float("nan"),
+        "chance": 1.0 / max(1, n_classes),
+    }
     if n_classes < 2 or X.shape[0] < 8:
-        return {
-            "n_classes": n_classes,
-            "loss": float("nan"),
-            "balanced_accuracy": float("nan"),
-            "macro_f1": float("nan"),
-        }
-    vloss, vout, yva = _linear_probe_1epoch(X, y, n_classes, "clf", seed)
-    pred, yt = vout.argmax(-1).numpy(), yva.numpy()
+        return nan
+    tr, va = _split(X.shape[0], 0.2, seed)
+    tr, va = tr.numpy(), va.numpy()
+    if len(set(y[tr].tolist())) < 2:  # need >=2 classes in the train split
+        return nan
+    Xs = _standardize(X, tr)
+    clf = RidgeClassifierCV(alphas=_ALPHAS, class_weight="balanced").fit(Xs[tr], y[tr])
+    pred = clf.predict(Xs[va])
     return {
         "n_classes": n_classes,
-        "loss": vloss,
-        "balanced_accuracy": float(balanced_accuracy_score(yt, pred)),
-        "macro_f1": float(f1_score(yt, pred, average="macro", zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y[va], pred)),
+        "macro_f1": float(f1_score(y[va], pred, average="macro", zero_division=0)),
         "chance": 1.0 / n_classes,
     }
 
@@ -144,19 +127,28 @@ def train_classification_probe(features: torch.Tensor, labels: list, seed: int =
 def train_regression_probe(
     features: torch.Tensor, targets: torch.Tensor, seed: int = 0
 ):
-    """1-epoch-from-scratch linear probe (fixed init); report the held-out probe
-    **loss** (MSE on a z-scored target -> 1.0 = predicting the mean) + R2."""
-    from sklearn.metrics import r2_score
+    """Closed-form ridge regression probe (RidgeCV, LOO-selected alpha), refit from
+    scratch each eval. Stable + sane at init (no signal -> r2~0, never << 0). Reports
+    R2 + val MSE on a z-scored target (1.0 = predicting the mean)."""
+    from sklearn.linear_model import RidgeCV
+    from sklearn.metrics import mean_squared_error, r2_score
 
     targets = targets.float()
     finite = torch.isfinite(targets)
     X, y = features[finite], targets[finite]
     if X.shape[0] < 8:
         return {"loss": float("nan"), "r2": float("nan")}
-    ymu, ysd = y.mean(), y.std().clamp(min=1e-6)
-    vloss, vout, yva = _linear_probe_1epoch(X, (y - ymu) / ysd, 1, "reg", seed)
-    yt, yp = yva.numpy(), vout.squeeze(-1).numpy()
-    return {"loss": vloss, "r2": float(r2_score(yt, yp))}
+    tr, va = _split(X.shape[0], 0.2, seed)
+    tr, va = tr.numpy(), va.numpy()
+    ymu, ysd = y[tr].mean(), y[tr].std().clamp(min=1e-6)
+    yz = ((y - ymu) / ysd).numpy()
+    Xs = _standardize(X, tr)
+    m = RidgeCV(alphas=_ALPHAS).fit(Xs[tr], yz[tr])
+    pred = m.predict(Xs[va])
+    return {
+        "loss": float(mean_squared_error(yz[va], pred)),
+        "r2": float(r2_score(yz[va], pred)),
+    }
 
 
 def run_probe_suite(
