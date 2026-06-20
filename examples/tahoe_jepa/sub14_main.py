@@ -286,24 +286,26 @@ def run_eval(
         )
     )
 
-    # per-class t-SNE panels (same figures + keys as eb_jepa periodic_eval)
+    # per-class t-SNE panels (optional; OFF in the scaling sweep — CPU t-SNE stalls
+    # the GPU, ×N processes in parallel = a barrier; probes/loss are all we need).
     paths: dict = {}
-    try:
-        os.makedirs(eval_dir, exist_ok=True)
-        emb = tsne_embed(
-            reps,
-            seed=int(cfg.meta.seed),
-            perplexity=float(cfg.eval.get("perplexity", 30.0)),
-        )
-        for c in list(
-            cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])
-        ):
-            if c in eval_meta:
-                p = os.path.join(eval_dir, f"tsne_{c}_step{step:06d}.png")
-                plot_tsne_single(emb, eval_meta[c], p, name=c, step=step)
-                paths[c] = p
-    except Exception:
-        logger.warning("t-SNE snapshot failed at step %d", step, exc_info=True)
+    if bool(cfg.eval.get("tsne", True)):
+        try:
+            os.makedirs(eval_dir, exist_ok=True)
+            emb = tsne_embed(
+                reps,
+                seed=int(cfg.meta.seed),
+                perplexity=float(cfg.eval.get("perplexity", 30.0)),
+            )
+            for c in list(
+                cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])
+            ):
+                if c in eval_meta:
+                    p = os.path.join(eval_dir, f"tsne_{c}_step{step:06d}.png")
+                    plot_tsne_single(emb, eval_meta[c], p, name=c, step=step)
+                    paths[c] = p
+        except Exception:
+            logger.warning("t-SNE snapshot failed at step %d", step, exc_info=True)
 
     if run is not None:
         log = dict(metrics)

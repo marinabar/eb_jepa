@@ -75,6 +75,7 @@ eval:
   enabled: true
   eval_every: 1000
   eval_cells: 1024
+  tsne: false                 # scaling sweep needs probes/loss only, not t-SNE
   encode_chunk: 128
   perplexity: 30.0
   classes: [organ, cell_line_id, drug, moa_fine]
