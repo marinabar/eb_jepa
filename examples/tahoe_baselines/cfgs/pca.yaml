@@ -1,0 +1,44 @@
+# PCA baseline on the densified Tahoe-100M gene vector — Dalia (CPU/single GB200).
+#
+# Plain linear PCA fit on a sampled dense matrix. No iterative training; we draw
+# `fit_cells` cells from the SAME stream, densify, fit sklearn PCA, and pickle the
+# fitted model. n_components = 256 matches sub14_small. PCA on a 62,713-wide matrix
+# is the honest linear-baseline floor for the headline comparison.
+#
+# Launch (CPU is fine; co-locate on the shared GPU allocation or run on login):
+#   /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python -m examples.tahoe_baselines.train \
+#       run --config examples/tahoe_baselines/cfgs/pca.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/baselines/pca
+
+model:
+  type: pca
+  n_components: 256     # == sub14_small representation dim (matched comparison)
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 256
+  num_workers: 6
+  pin_mem: false
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  n_genes: 62713
+
+optim:
+  fit_cells: 50000     # cells sampled from the stream to fit PCA on
+
+training:
+  native_bf16: false   # PCA runs in fp32 on CPU (sklearn)
+
+eval:
+  enabled: true
+  eval_cells: 1024
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

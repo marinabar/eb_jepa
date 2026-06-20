@@ -1,0 +1,59 @@
+# MAE baseline on the densified Tahoe-100M gene vector — Dalia single GB200.
+#
+# Headline comparison (CLAUDE.md "Success criteria"): JEPA must beat *well-tuned*
+# MAE / VAE / PCA. The MAE is a denoising autoencoder on the dense 62,713-gene
+# CP10k+log1p vector; a random fraction of genes is zeroed at the input and the
+# MSE is taken on the masked entries. The representation is the bottleneck latent.
+#
+# latent = 256 matches the sub14_small pre-projection rep dim so the probe
+# comparison is at MATCHED representation width. hidden is sized for a comparable
+# (encoder+decoder) parameter budget given the 62,713-wide input.
+#
+# Launch (1 GPU):
+#   /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python -m examples.tahoe_baselines.train \
+#       run --config examples/tahoe_baselines/cfgs/mae.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/baselines/mae
+
+model:
+  type: mae
+  hidden: 1024          # encoder/decoder MLP width
+  latent: 256           # == sub14_small representation dim (matched comparison)
+  mask_frac: 0.5        # fraction of genes zeroed at input (denoising target)
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset   # same stream as sub14_small
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 256
+  num_workers: 6
+  pin_mem: true
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  n_genes: 62713        # max Tahoe token_id + 1 (densify width)
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  max_grad_norm: 1.0
+  max_steps: 4000       # ~1M cells at bs=256; the densified MLP converges fast
+  max_minutes: 45
+
+training:
+  native_bf16: true     # bf16 throughout (set false for fp32/CPU smoke)
+  log_every: 25
+  ckpt_every_steps: 1000
+
+eval:
+  enabled: true
+  eval_every: 1000
+  eval_cells: 1024      # shared fixed eval set for the in-run probe snapshot
+  encode_chunk: 256
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

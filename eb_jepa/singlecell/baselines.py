@@ -27,7 +27,7 @@ class DensifyCollator:
             [densify(c["gene_token_ids"], c["values"], self.n_genes) for c in batch]
         )
         meta_keys = ("drug", "sample", "cell_line_id", "organ", "moa_fine", "plate")
-        out = {"dense": dense}
+        out: dict = {"dense": dense}
         for k in meta_keys:
             out[k] = [c.get(k) for c in batch]
         out["log_conc"] = torch.tensor(

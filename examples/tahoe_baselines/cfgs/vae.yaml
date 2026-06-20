@@ -1,0 +1,58 @@
+# VAE baseline on the densified Tahoe-100M gene vector — Dalia single GB200.
+#
+# Vanilla Gaussian VAE (MSE reconstruction + KL). The representation is the
+# posterior mean mu. kl_coeff is the key knob: too high -> posterior collapse
+# (mu -> 0, effective rank -> 1); too low -> a plain AE. 1e-3 is a sane default
+# for a 62,713-dim MSE reconstruction; sweep it for the well-tuned comparison.
+#
+# latent = 256 matches sub14_small. hidden sized for a comparable parameter
+# budget (encoder is n_genes->hidden->hidden, two heads to latent, symmetric dec).
+#
+# Launch (1 GPU):
+#   /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python -m examples.tahoe_baselines.train \
+#       run --config examples/tahoe_baselines/cfgs/vae.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/baselines/vae
+
+model:
+  type: vae
+  hidden: 1024
+  latent: 256           # == sub14_small representation dim (matched comparison)
+  kl_coeff: 1.0e-3      # KL weight; sweep {1e-4, 1e-3, 1e-2} for tuning
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 256
+  num_workers: 6
+  pin_mem: true
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  n_genes: 62713
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  max_grad_norm: 1.0
+  max_steps: 4000
+  max_minutes: 45
+
+training:
+  native_bf16: true
+  log_every: 25
+  ckpt_every_steps: 1000
+
+eval:
+  enabled: true
+  eval_every: 1000
+  eval_cells: 1024
+  encode_chunk: 256
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
