@@ -111,16 +111,8 @@ def fig_loss(runs):
     print(f"loss: E={E:.3f} alpha={alpha:.3f} R2={r2:.3f}")
 
 
-def fit_saturating(C, V):  # acc = G - B*C^(-beta) ; grid ceiling G, log-log fit of (G-acc)
-    C, V = np.asarray(C, float), np.asarray(V, float)
-    best = (1.0, 0.0, 0.0, -1e9)
-    for G in np.linspace(V.max() + 1e-3, min(1.0, V.max() + 0.25), 250):
-        y, x = np.log(G - V), np.log(C)
-        b1, b0 = np.polyfit(x, y, 1)
-        r2 = 1 - ((y - (b0 + b1 * x)) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-12)
-        if r2 > best[3]:
-            best = (G, -b1, math.exp(b0), r2)
-    return best  # G, beta, B, r2
+def _logistic(x, lo, hi, k, x0):  # S-curve in log10(compute): floor -> rise -> ceiling
+    return lo + (hi - lo) / (1.0 + np.exp(-k * (x - x0)))
 
 
 def fig_probe(runs):
@@ -140,11 +132,17 @@ def fig_probe(runs):
             bp = float(allP[m][j])
         fc.append(math.sqrt(bins[b - 1] * bins[b])); fv.append(best); fp.append(bp)
     fc, fv, fp = np.array(fc), np.array(fv), np.array(fp)
-    G, beta, B, r2 = fit_saturating(fc, fv)
+    from scipy.optimize import curve_fit
+
+    x = np.log10(fc)
+    p0 = [float(fv.min()), float(min(1.0, fv.max() + 0.03)), 2.0, float(np.median(x))]
+    popt, _ = curve_fit(_logistic, x, fv, p0=p0, maxfev=40000,
+                        bounds=([-0.2, 0.3, 0.2, x.min()], [0.4, 1.0, 12.0, x.max()]))
+    r2 = 1 - ((fv - _logistic(x, *popt)) ** 2).sum() / max(((fv - fv.mean()) ** 2).sum(), 1e-12)
     fig, ax = plt.subplots(figsize=(8, 6.2))
     cc = np.geomspace(fc.min(), fc.max(), 200)
-    ax.plot(cc, G - B * cc ** (-beta), color=INK, lw=2.4, ls="--", zorder=3,
-            label=f"fit  acc = {G:.2f} − {B:.2g}·C^(−{beta:.2f})\nR²={r2:.3f}")
+    ax.plot(cc, _logistic(np.log10(cc), *popt), color=INK, lw=2.4, ls="--", zorder=3,
+            label=f"logistic fit  ceiling={popt[1]:.2f}\nR²={r2:.3f}")
     sc = ax.scatter(fc, fv, c=fp / 1e6, cmap="viridis", s=85, zorder=4,
                     edgecolor="white", lw=0.7,
                     norm=plt.cm.colors.LogNorm(allP.min() / 1e6, allP.max() / 1e6))
@@ -156,7 +154,7 @@ def fig_probe(runs):
     fig.tight_layout()
     for e in ("png", "pdf"):
         fig.savefig(f"{OUTP}.{e}", dpi=220, bbox_inches="tight")
-    print(f"probe: ceiling G={G:.3f} beta={beta:.3f} R2={r2:.3f} max={fv.max():.3f}")
+    print(f"probe: logistic ceiling={popt[1]:.3f} R2={r2:.3f} max={fv.max():.3f}")
 
 
 def main():
