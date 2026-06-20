@@ -1,0 +1,94 @@
+# HIERARCHICAL Subliminal 1.4 — sub14_small + a second, abstract attention
+# level over the 50 hallmark pathways (genes -> pathways -> genes/CELL).
+#
+# Identical SCALE + recipe to sub14_small (d256 / 2 layers / 4 heads, sigmoid
+# attention, per-cell quantile thermometer counts, Muon+AdamW no scheduler,
+# pairwise-cosine JEPA + SIGReg), so it warm-starts key-for-key from the
+# trained sub14_small checkpoint and only the pathway level is freshly learned.
+# The LeJEPA loss and the [CELL] readout are unchanged.
+#
+# Launch (1 GPU):
+#   torchrun --nproc_per_node=1 -m examples.tahoe_jepa.sub14_main run \
+#       --config examples/tahoe_jepa/cfgs/sub14_small_hier.yaml
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/sub14_small_hier
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset   # 16 spread-out shards
+  split: train
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 32
+  num_workers: 6
+  pin_mem: true
+  max_cells: 0
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+  num_bins: 16
+  genes_per_bin: 32          # max_genes_per_cell = 512
+  n_views: 4
+  binomial_subsample:
+    enabled: true
+    p_min: 0.5
+    p_max: 0.9
+
+model:
+  d_model: 256
+  n_heads: 4                 # head_dim 64
+  n_layers: 2
+  d_ff: 1024
+  dropout: 0.1
+  proj_dim: 128
+  attention_activation: sigmoid
+  freeze_features: true
+  grad_checkpoint: false
+  compile: false
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+  # --- hierarchical (pathway level) ---
+  hierarchical: true
+  pathway_membership: /lustre/work/vivatech-unaite/shared/tahoe-cache/pathway_membership.pt
+  # hier_positions: [0]      # default: after every gene layer but the last -> [0] for 2 layers
+  # Warm-start from the trained sub14_small encoder (gene body + projector +
+  # count table + [CELL]); the pathway blocks are freshly initialised.
+  warmstart_checkpoint: /lustre/work/vivatech-unaite/ljung/runs/sub14_small/encoder_final.pt
+
+loss:
+  sigreg_weight: 0.4
+  jepa_loss: cosine
+  sigreg_slices: 256
+  sigreg_knots: 17
+  sigreg_t_max: 3.0
+
+optim:
+  muon_lr: 2.0e-4
+  muon_weight_decay: 0.1
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  adamw_lr: 2.0e-4
+  adamw_weight_decay: 0.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 1.0e-8
+  epochs: 100
+  max_steps: 0
+  max_grad_norm: 1.0
+
+training:
+  native_bf16: true
+  log_every: 10
+  ckpt_every_steps: 1000
+  max_minutes: 45
+
+eval:
+  enabled: true
+  eval_every: 200
+  eval_cells: 1024
+  encode_chunk: 128
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

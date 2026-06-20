@@ -31,7 +31,13 @@ from torch.utils.data import DataLoader
 from eb_jepa.datasets.tahoe.dataset import TahoeConfig, TahoeIterableDataset
 from eb_jepa.logging import get_logger
 from eb_jepa.singlecell.sub14.collator import Sub14Collator
-from eb_jepa.singlecell.sub14.features import load_pc_features, random_pc_features
+from eb_jepa.singlecell.sub14.features import (
+    load_pathway_membership,
+    load_pc_features,
+    random_pathway_membership,
+    random_pc_features,
+)
+from eb_jepa.singlecell.sub14.hierarchical import HierarchicalSubliminal14
 from eb_jepa.singlecell.sub14.model import Subliminal14
 from eb_jepa.singlecell.sub14.optim import build_muon_adamw_optimizer
 from eb_jepa.singlecell.sub14.sigreg import SIGReg
@@ -81,25 +87,46 @@ def jepa_pair_loss(view_projections: list[torch.Tensor], kind: str = "cosine") -
 # --------------------------------------------------------------------------- #
 # Build                                                                       #
 # --------------------------------------------------------------------------- #
-def build_model(cfg, pc, train_dtype, device) -> Subliminal14:
+def build_model(cfg, pc, train_dtype, device, pathway_membership=None) -> nn.Module:
     num_bins = int(cfg.data.get("num_bins", 16))
     genes_per_bin = int(cfg.data.get("genes_per_bin", 32))
-    model = Subliminal14(
-        n_pc_genes=pc.n_pc_genes,
-        d_model=int(cfg.model.d_model),
-        n_heads=int(cfg.model.n_heads),
-        n_layers=int(cfg.model.n_layers),
-        d_ff=int(cfg.model.d_ff),
-        dropout=float(cfg.model.get("dropout", 0.1)),
-        latent_dim=int(cfg.model.get("proj_dim", 128)),
-        num_bins=num_bins,
-        max_genes_per_cell=num_bins * genes_per_bin,
-        dna_features=pc.dna_features,
-        protein_features=pc.protein_features,
-        freeze_features=bool(cfg.model.get("freeze_features", True)),
-        attention_activation=str(cfg.model.get("attention_activation", "sigmoid")),
-        grad_checkpoint=bool(cfg.model.get("grad_checkpoint", False)),
-    )
+    n_pc_genes = pc.n_pc_genes
+    d_model = int(cfg.model.d_model)
+    n_heads = int(cfg.model.n_heads)
+    n_layers = int(cfg.model.n_layers)
+    d_ff = int(cfg.model.d_ff)
+    dropout = float(cfg.model.get("dropout", 0.1))
+    latent_dim = int(cfg.model.get("proj_dim", 128))
+    max_genes_per_cell = num_bins * genes_per_bin
+    freeze_features = bool(cfg.model.get("freeze_features", True))
+    attention_activation = str(cfg.model.get("attention_activation", "sigmoid"))
+    grad_checkpoint = bool(cfg.model.get("grad_checkpoint", False))
+
+    if bool(cfg.model.get("hierarchical", False)):
+        if pathway_membership is None:
+            raise ValueError("hierarchical model requires pathway_membership")
+        hier_positions = cfg.model.get("hier_positions", None)
+        model: nn.Module = HierarchicalSubliminal14(
+            n_pc_genes=n_pc_genes,
+            pathway_membership=pathway_membership.membership,
+            hier_positions=list(hier_positions) if hier_positions is not None else None,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
+            dropout=dropout, latent_dim=latent_dim, num_bins=num_bins,
+            max_genes_per_cell=max_genes_per_cell,
+            dna_features=pc.dna_features, protein_features=pc.protein_features,
+            freeze_features=freeze_features, attention_activation=attention_activation,
+            grad_checkpoint=grad_checkpoint,
+        )
+    else:
+        model = Subliminal14(
+            n_pc_genes=n_pc_genes,
+            d_model=d_model, n_heads=n_heads, n_layers=n_layers, d_ff=d_ff,
+            dropout=dropout, latent_dim=latent_dim, num_bins=num_bins,
+            max_genes_per_cell=max_genes_per_cell,
+            dna_features=pc.dna_features, protein_features=pc.protein_features,
+            freeze_features=freeze_features, attention_activation=attention_activation,
+            grad_checkpoint=grad_checkpoint,
+        )
     return model.to(device=device, dtype=train_dtype)
 
 
@@ -297,9 +324,24 @@ def train(cfg, device=None):
         if is_main(rank):
             logger.warning("RANDOM PC features (no cache) — smoke/dev only.")
 
+    # Hallmark pathway membership (hierarchical model only): genes -> pathway level.
+    pathway_membership = None
+    if bool(cfg.model.get("hierarchical", False)):
+        mem_path = cfg.model.get("pathway_membership", "")
+        if mem_path and os.path.exists(mem_path):
+            pathway_membership = load_pathway_membership(mem_path, pc)
+            if is_main(rank):
+                logger.info(
+                    f"loaded {pathway_membership.n_pathways} hallmark pathways from {mem_path}"
+                )
+        else:
+            pathway_membership = random_pathway_membership(pc)
+            if is_main(rank):
+                logger.warning("RANDOM pathway membership (no cache) — smoke/dev only.")
+
     loader, dataset, collator = build_loader(cfg, pc, rank, world)
 
-    model = build_model(cfg, pc, train_dtype, device)
+    model = build_model(cfg, pc, train_dtype, device, pathway_membership)
 
     # Optional warm-start from a trained Subliminal 1.4 checkpoint (shape-matched:
     # reuses the transformer body + projector + count table + [CELL] token when the

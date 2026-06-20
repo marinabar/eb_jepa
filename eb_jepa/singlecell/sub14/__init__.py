@@ -24,6 +24,12 @@ from eb_jepa.singlecell.sub14.embeddings import (
     QuantileThermometerCountEmbedding,
 )
 from eb_jepa.singlecell.sub14.encoder import EncoderSub14
+from eb_jepa.singlecell.sub14.hierarchical import (
+    HierarchicalEncoderSub14,
+    HierarchicalSubliminal14,
+    HierCrossAttention,
+    PathwayHierarchyBlock,
+)
 from eb_jepa.singlecell.sub14.model import Subliminal14, Subliminal14Output
 from eb_jepa.singlecell.sub14.sigreg import SIGReg
 from eb_jepa.singlecell.sub14.sigmoid_attention import SigmoidAttention
@@ -35,6 +41,10 @@ __all__ = [
     "EncoderSub14",
     "Subliminal14",
     "Subliminal14Output",
+    "HierarchicalSubliminal14",
+    "HierarchicalEncoderSub14",
+    "PathwayHierarchyBlock",
+    "HierCrossAttention",
     "SIGReg",
     "SigmoidAttention",
     "SwiGLUFFN",
