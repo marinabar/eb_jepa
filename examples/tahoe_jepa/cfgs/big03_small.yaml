@@ -1,0 +1,75 @@
+# Fast-iteration config: the big_lam03_d768 run's hyperparameters (wandb group "big",
+# lamb=0.3, lr=2e-3, bs=32, count_mode A, L=4096, embed_norm=ln, num_slices=1024,
+# max_steps=2500) reused VERBATIM, but with a much SMALLER model (d256 / 2 layers) so
+# it trains in minutes for quick architecture/lambda iteration. Paths remapped to
+# Dalia; single-GPU (3-GPU group cap); compile + grad_checkpoint off (tiny model ->
+# faster startup, no recompute needed).
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/big03_small
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset
+  split: train
+  L: 4096
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: A            # big_lam03 used continuous counts (no quantile bins)
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 32           # reused from big_lam03 (single-GPU)
+  num_workers: 6
+  pin_mem: true
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+
+model:
+  d_model: 256             # << shrunk from 768
+  n_layers: 2              # << shrunk from 10
+  n_heads: 4               # head_dim 64 (256/4)
+  n_kv_heads: 1            # GQA 4:1
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 2048
+  proj_dim: 128
+  embed_norm: ln           # big_lam03 hyperparameter (per-component embedding LayerNorm)
+  grad_checkpoint: false   # tiny model -> no need; faster
+  compile: false           # faster startup for quick iteration
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+
+loss:
+  lamb: 0.3                # big_lam03
+  num_slices: 1024
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100
+  max_steps: 2500          # big_lam03
+  lr: 0.002                # big_lam03 (NOT the collapse-sweep's 1e-4)
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+eval:
+  enabled: true
+  eval_every: 200
+  eval_cells: 1024
+  loss_cells: 128
+  classes: [organ, cell_line_id, drug, moa_fine]
+  encode_chunk: 128
+  perplexity: 30.0
+
+training:
+  amp: true
+  log_every: 10
+  ckpt_every_epoch: false
+  max_minutes: 45
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
