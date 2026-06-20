@@ -9,7 +9,7 @@
 # Wide lambda grid (0.001 .. 0.5) probes the full collapse -> over-regularization
 # curve; a pathway-token run at the reference lambda exercises the new hallmark
 # tokens. Build the membership cache first (one-off):
-#   srun --reservation=Vivatech --account=vivatech --partition=defq --gres=gpu:b200:1 \
+#   srun --reservation=Vivatech --account=vivatech-unaite --partition=defq --gres=gpu:b200:1 \
 #        --cpus-per-task=8 --time=00:10:00 \
 #        /lustre/work/vivatech-unaite/ljung/venv-arm/bin/python \
 #        scripts/build_pathway_membership.py \

@@ -5,7 +5,7 @@
 # --nproc_per_node=4). Caches are redirected off the tiny home (inode quota).
 #SBATCH --partition=defq
 #SBATCH --reservation=Vivatech
-#SBATCH --account=vivatech
+#SBATCH --account=vivatech-unaite
 #SBATCH --gres=gpu:b200:4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
