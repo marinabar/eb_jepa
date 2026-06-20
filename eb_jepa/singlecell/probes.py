@@ -153,14 +153,24 @@ def train_regression_probe(
     }
 
 
-def run_probe_suite(features: torch.Tensor, meta: dict) -> dict:
-    """Run the standard classification + regression probes; return a metrics dict."""
+def run_probe_suite(
+    features: torch.Tensor, meta: dict, epochs: int | None = None
+) -> dict:
+    """Run the standard classification + regression probes; return a metrics dict.
+
+    ``epochs`` (optional) caps probe-training length for fast periodic evals; when
+    ``None`` each probe trainer uses its own default.
+    """
+    clf_kw = {} if epochs is None else {"epochs": epochs}
+    reg_kw = {} if epochs is None else {"epochs": epochs}
     results = {}
     for key in ("organ", "cell_line_id", "drug", "sample", "moa_fine"):
         if key in meta and len(set(meta[key])) >= 2:
-            results[f"clf/{key}"] = train_classification_probe(features, meta[key])
+            results[f"clf/{key}"] = train_classification_probe(
+                features, meta[key], **clf_kw
+            )
     if "gene_count" in meta:
         results["reg/gene_count"] = train_regression_probe(
-            features, torch.tensor(meta["gene_count"])
+            features, torch.tensor(meta["gene_count"]), **reg_kw
         )
     return results
