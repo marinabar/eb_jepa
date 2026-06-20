@@ -60,6 +60,17 @@ loss:
   ode_steps: 20          # ODE integration steps at eval/inference (flow matching)
   ode_method: heun       # euler | heun | midpoint
 
+memory:
+  # Per-stratum latent memory bank. The encoder is frozen, so past detached latents
+  # are exact extra samples of each stratum -> accumulate them across steps to grow
+  # the per-step source/target clouds when few strata co-occur in a single batch.
+  enabled: true
+  capacity_per_key: 1024   # FIFO ring-buffer size per stratum key
+  min_source: 8            # min combined (batch+bank) source cloud to compute the loss
+  min_target: 8            # min combined target cloud
+  warmup_steps: 50         # fill the bank before relying on it (still trains meanwhile)
+  device: cpu              # keep buffers off the GPU; moved to compute device when used
+
 optim:
   epochs: 50
   max_steps: 20000       # >0 caps total optimizer steps

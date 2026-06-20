@@ -39,6 +39,11 @@ from eb_jepa.singlecell.perturbator.hepatotox_features import HepatotoxActionFea
 from eb_jepa.singlecell.perturbator.flow import flow_matching_loss, predict_perturbed
 from eb_jepa.singlecell.perturbator.losses import sliced_wasserstein
 from eb_jepa.singlecell.perturbator.matching import build_strata
+from eb_jepa.singlecell.perturbator.memory import (
+    LatentMemoryBank,
+    make_source_key,
+    make_target_key,
+)
 from eb_jepa.singlecell.perturbator.model import Perturbator
 from eb_jepa.singlecell.sub14.collator import Sub14Collator
 from eb_jepa.singlecell.sub14.features import load_pc_features, random_pc_features
@@ -209,30 +214,114 @@ def _valid_strata(latents, batch, cfg):
     return [s for s in strata if s.source.shape[0] >= min_src and s.target.shape[0] >= min_tgt]
 
 
-def perturbator_step(perturbator, featurizer, latents, batch, cfg, device, gen):
-    """One step over all valid strata. Returns (loss, metrics) or (None, {...})."""
+def _all_strata(latents, batch):
+    """All strata in the batch (no min-size filter — the bank may complete them)."""
+    return build_strata(
+        latents,
+        batch["cell_line_id"],
+        batch["plate"],
+        batch["drug"],
+        batch["canonical_smiles"],
+        batch["log_conc"],
+    )
+
+
+def perturbator_step(perturbator, featurizer, latents, batch, cfg, device, gen, bank=None):
+    """One step over all valid strata, optionally augmenting clouds from the memory bank.
+
+    With ``bank`` (frozen-encoder latent memory), each stratum's per-batch source/target
+    clouds are concatenated with past detached latents of the same stratum before the
+    loss is computed, then the bank is updated with the current batch. The bank holds
+    no-grad tensors, so gradient flows only through the current-batch latents and the
+    perturbator — never into stored latents.
+
+    Returns ``(loss, metrics)`` or ``(None, {...})`` when no stratum reaches the
+    minimum cloud sizes.
+    """
     objective = str(cfg.loss.get("objective", "flow_matching"))
-    strata = _valid_strata(latents, batch, cfg)
-    losses, sw_eval = [], []
     sw_slices = int(cfg.loss.get("sw_slices", 256))
     sw_p = int(cfg.loss.get("sw_p", 2))
+
+    if bank is None:
+        # Original per-batch-only path (memory disabled).
+        strata = _valid_strata(latents, batch, cfg)
+        losses = []
+        for s in strata:
+            action = featurizer.featurize(s.smiles, s.log_conc).to(device)
+            if objective == "flow_matching":
+                loss = flow_matching_loss(
+                    perturbator, s.source, s.target.detach(), action, generator=gen
+                )
+            elif objective == "direct":
+                pred = perturbator(s.source, action)
+                loss = sliced_wasserstein(
+                    pred, s.target.detach(), n_slices=sw_slices, p=sw_p
+                )
+            else:
+                raise ValueError(f"unknown objective {objective!r}")
+            losses.append(loss)
+        if not losses:
+            return None, {"n_strata": 0}
+        loss = torch.stack(losses).mean()
+        return loss, {"n_strata": len(losses), f"{objective}_loss": float(loss.detach())}
+
+    # Memory-augmented path.
+    mem = cfg.get("memory", {})
+    min_src = int(mem.get("min_source", cfg.loss.get("min_source", 8)))
+    min_tgt = int(mem.get("min_target", cfg.loss.get("min_target", 8)))
+    dtype = latents.dtype
+
+    def _bank_cloud(bank_latents):
+        if bank_latents is None:
+            return None
+        return bank_latents.to(device=device, dtype=dtype)
+
+    strata = _all_strata(latents, batch)
+    losses = []
+    updates = []  # (src_key, batch_source, tgt_key, batch_target) applied AFTER the loss
     for s in strata:
+        src_key = make_source_key(*s.stratum)
+        tgt_key = make_target_key(*s.stratum, s.drug, s.log_conc)
+        # augment for the loss (concat current batch with past detached latents)
+        bank_src = _bank_cloud(bank.get_source(src_key))
+        bank_tgt = _bank_cloud(bank.get_target(tgt_key))
+        source_cloud = s.source if bank_src is None else torch.cat([s.source, bank_src], 0)
+        target_cloud = s.target if bank_tgt is None else torch.cat([s.target, bank_tgt], 0)
+        # schedule the bank update with the CURRENT batch clouds (no double-counting)
+        updates.append((src_key, s.source.detach(), tgt_key, s.target.detach()))
+        if source_cloud.shape[0] < min_src or target_cloud.shape[0] < min_tgt:
+            continue
         action = featurizer.featurize(s.smiles, s.log_conc).to(device)
         if objective == "flow_matching":
             loss = flow_matching_loss(
-                perturbator, s.source, s.target.detach(), action, generator=gen
+                perturbator, source_cloud, target_cloud.detach(), action, generator=gen
             )
-            losses.append(loss)
         elif objective == "direct":
-            pred = perturbator(s.source, action)
-            loss = sliced_wasserstein(pred, s.target.detach(), n_slices=sw_slices, p=sw_p)
-            losses.append(loss)
+            pred = perturbator(source_cloud, action)
+            loss = sliced_wasserstein(
+                pred, target_cloud.detach(), n_slices=sw_slices, p=sw_p
+            )
         else:
             raise ValueError(f"unknown objective {objective!r}")
+        losses.append(loss)
+
+    # Update the bank AFTER computing this step's losses (frozen latents, detached).
+    for src_key, batch_source, tgt_key, batch_target in updates:
+        bank.update_source(src_key, batch_source)
+        bank.update_target(tgt_key, batch_target)
+
+    metrics = {
+        "memory/total_entries": bank.total_entries(),
+        "memory/n_source_keys": bank.n_source_keys(),
+        "memory/n_target_keys": bank.n_target_keys(),
+    }
     if not losses:
-        return None, {"n_strata": 0}
+        metrics["n_strata"] = 0
+        return None, metrics
     loss = torch.stack(losses).mean()
-    return loss, {"n_strata": len(losses), f"{objective}_loss": float(loss.detach())}
+    metrics["n_strata"] = len(losses)
+    metrics[f"{objective}_loss"] = float(loss.detach())
+    return loss, metrics
 
 
 @torch.no_grad()
@@ -354,6 +443,26 @@ def train(cfg, device=None):
     log_every = int(cfg.training.get("log_every", 20))
     max_minutes = float(cfg.training.get("max_minutes", 0))
 
+    # Per-stratum latent memory bank: because the encoder is frozen, past detached
+    # latents are exact extra samples of each stratum, so we accumulate them to grow
+    # the per-step source/target clouds (helps when few strata co-occur per batch).
+    mem_cfg = cfg.get("memory", {})
+    bank = None
+    mem_warmup = 0
+    if bool(mem_cfg.get("enabled", False)):
+        bank = LatentMemoryBank(
+            capacity_per_key=int(mem_cfg.get("capacity_per_key", 1024)),
+            device=str(mem_cfg.get("device", "cpu")),
+            max_keys=mem_cfg.get("max_keys"),
+            max_entries=mem_cfg.get("max_entries"),
+        )
+        mem_warmup = int(mem_cfg.get("warmup_steps", 0))
+        logger.info(
+            f"latent memory bank enabled (capacity_per_key="
+            f"{int(mem_cfg.get('capacity_per_key', 1024))}, device="
+            f"{mem_cfg.get('device', 'cpu')}, warmup_steps={mem_warmup})"
+        )
+
     def _eval(step):
         if eval_batch is None:
             return
@@ -381,7 +490,7 @@ def train(cfg, device=None):
             latents = encode_cells(encoder, batch, device, amp)  # frozen, no grad
             opt.zero_grad(set_to_none=True)
             loss, metrics = perturbator_step(
-                perturbator, featurizer, latents, batch, cfg, device, gen
+                perturbator, featurizer, latents, batch, cfg, device, gen, bank=bank
             )
             if loss is None:
                 continue  # no valid stratum (no control/target pair) in this batch
