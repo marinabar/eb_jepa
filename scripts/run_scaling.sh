@@ -10,13 +10,15 @@ export PATH="$PATH:/root/.local/bin" GIT_LFS_SKIP_SMUDGE=1 PYTHONPATH=/data/eb_j
 export WANDB_RUN_GROUP=scaling
 CFG=examples/tahoe_jepa/cfgs/scaling_base.yaml
 
+# Uniform max_steps -> SAME token budget per rung (global batch fixed at 256), so the
+# only varied axis is model size. LR cosine sized to max_steps; max_minutes = safety.
 # name            d     L   heads kv  max_steps max_minutes
 RUNS=(
-  "s1_d256_l4    256   4   4     1   600       12"
-  "s2_d384_l6    384   6   6     1   700       16"
-  "s3_d512_l8    512   8   8     2   800       23"
-  "s4_d768_l10   768   10  12    3   900       33"
-  "s5_d1024_l12  1024  12  16    4   950       46"
+  "s1_d256_l4    256   4   4     1   1500      14"
+  "s2_d384_l6    384   6   6     1   1500      18"
+  "s3_d512_l8    512   8   8     2   1500      26"
+  "s4_d768_l10   768   10  12    3   1500      42"
+  "s5_d1024_l12  1024  12  16    4   1500      62"
 )
 
 for r in "${RUNS[@]}"; do
