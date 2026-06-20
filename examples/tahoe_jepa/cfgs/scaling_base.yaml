@@ -37,7 +37,8 @@ model:
   proj_hidden: 2048
   proj_dim: 128
   grad_checkpoint: true      # required at L=4096 (see GPU-saturation finding)
-  compile: false             # off: no warmup eating short budgets; clean FLOP count
+  compile: true              # verified: compiles once on fixed shapes (no recompile),
+                             # no grad-checkpoint conflict, ~step warmup then fast
   gene_emb_cache: /data/gene_emb_cache
 
 loss:
