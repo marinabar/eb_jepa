@@ -48,12 +48,18 @@ class SIGReg(nn.Module):
         sin_mean = x_t.sin().mean(-3)
         n = proj.size(-2)
 
-        if dist.is_available() and dist.is_initialized():
-            # AVG of per-rank means == global mean (equal per-rank batch sizes,
-            # drop_last=True). Scale by global N below.
-            dist.all_reduce(cos_mean, op=dist.ReduceOp.AVG)
-            dist.all_reduce(sin_mean, op=dist.ReduceOp.AVG)
-            n = n * dist.get_world_size()
+        world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+        if world > 1:
+            # Global mean over the full batch = (1/W) * sum_r(per-rank mean). Use the
+            # autograd-aware collective (torch.distributed.nn.functional.all_reduce)
+            # so gradients flow back to every rank's samples — plain dist.all_reduce
+            # is NOT differentiable (silently wrong grads). Lock-step RNG (self.step)
+            # keeps the slice directions identical across ranks.
+            import torch.distributed.nn as dist_nn
+
+            cos_mean = dist_nn.all_reduce(cos_mean, op=dist.ReduceOp.SUM) / world
+            sin_mean = dist_nn.all_reduce(sin_mean, op=dist.ReduceOp.SUM) / world
+            n = n * world
 
         err = (cos_mean - self.phi).square() + sin_mean.square()
         statistic = (err @ self.weights) * n
