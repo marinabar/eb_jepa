@@ -86,9 +86,10 @@ def periodic_eval(
     seed: int = 0,
     amp: bool = True,
 ):
-    """Encode the held-out eval set, run detached probes + a t-SNE panel, and log to
-    wandb. Returns (metrics, tsne_path). Probes are imbalance-aware (balanced acc /
-    macro-F1 for classes; R2 for gene-count); ``repr/effective_rank`` tracks collapse.
+    """Encode the held-out eval set, run detached probes + per-class t-SNE panels, and
+    log to wandb. Returns (metrics, paths) where ``paths`` maps each class to its
+    t-SNE image. Probes are imbalance-aware (balanced acc / macro-F1 for classes; R2
+    for gene-count); ``repr/effective_rank`` tracks collapse.
     """
     from eb_jepa.singlecell.probes import run_probe_suite
     from eb_jepa.singlecell.visualize import effective_rank
@@ -105,20 +106,24 @@ def periodic_eval(
     metrics["repr/effective_rank"] = float(effective_rank(reps))
 
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"tsne_step{step:06d}.png")
     emb = tsne_embed(reps, seed=seed, perplexity=perplexity)
-    plot_tsne_grid(emb, {c: labels[c] for c in classes}, path, step=step)
+    paths = {}
+    for c in classes:
+        p = os.path.join(out_dir, f"tsne_{c}_step{step:06d}.png")
+        plot_tsne_single(emb, labels[c], p, name=c, step=step)
+        paths[c] = p
 
     if run is not None:
         log = dict(metrics)
         try:
             import wandb
 
-            log["tsne/representation"] = wandb.Image(path, caption=f"step {step}")
+            for c, p in paths.items():
+                log[f"tsne/{c}"] = wandb.Image(p, caption=f"step {step}")
         except Exception:
             pass
         run.log(log, step=step)
-    return metrics, path
+    return metrics, paths
 
 
 @torch.no_grad()
