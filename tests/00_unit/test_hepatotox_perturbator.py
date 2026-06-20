@@ -9,15 +9,22 @@ import torch
 from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
 from eb_jepa.singlecell.perturbator.flow import flow_matching_loss, predict_perturbed
 from eb_jepa.singlecell.perturbator.hepatotox_features import (
+    HEPATOTOX_DRUGS,
+    LOW_DILI_DRUGS,
     HepatotoxActionFeaturizer,
     HepatotoxPathwayFeaturizer,
+    dili_label_by_name,
+    weak_dili_label_from_moa,
 )
 from eb_jepa.singlecell.perturbator.model import Perturbator
 from examples.tahoe_hepatotox.validate_perturbator import (
+    _rank_findings,
     balanced_accuracy_at_threshold,
     centroid_cosine,
+    cv_axis_scores,
     dose_response_slope,
     gap_closed,
+    mannwhitney_p,
     moa_hierarchy_cosine,
     roc_auc,
     spearman,
@@ -148,9 +155,15 @@ class TestValidationHelpers:
     def test_spearman(self):
         x = [1, 2, 3, 4, 5]
         y = [2, 4, 6, 8, 10]  # perfectly monotone
-        assert abs(spearman(x, y) - 1.0) < 1e-9
-        assert abs(spearman(x, y[::-1]) + 1.0) < 1e-9
-        assert np.isnan(spearman([1, 2], [3, 4]))  # too few points
+        rho, p = spearman(x, y)
+        assert abs(rho - 1.0) < 1e-9
+        rho_r, _ = spearman(x, y[::-1])
+        assert abs(rho_r + 1.0) < 1e-9
+        rho_few, p_few = spearman([1, 2], [3, 4])  # too few points
+        assert np.isnan(rho_few) and np.isnan(p_few)
+        # a noisy-but-monotone trend yields a finite p-value in (0, 1]
+        rho2, p2 = spearman([1, 2, 3, 4, 5, 6], [1, 1, 2, 2, 3, 3])
+        assert 0.0 < rho2 <= 1.0 and 0.0 <= p2 <= 1.0
 
     def test_moa_hierarchy_cosine(self):
         # two MoAs: A drugs point the same way, B drugs point opposite to A
@@ -159,16 +172,110 @@ class TestValidationHelpers:
             [-1.0, 0.0], [-1.0, 0.1],  # MoA B (aligned to each other, opposite A)
         ])
         labels = ["A", "A", "B", "B"]
-        m = moa_hierarchy_cosine(disp, labels)
+        m = moa_hierarchy_cosine(disp, labels, n_perm=500, seed=0)
         assert m["intra"] > m["inter"]
         assert m["separation"] > 0
         assert m["n_pairs_intra"] == 2  # (A,A) and (B,B)
         assert m["n_pairs_inter"] == 4  # cross pairs
+        # perfectly separated -> small permutation p-value
+        assert 0.0 < m["p_value"] <= 1.0
 
     def test_moa_hierarchy_excludes_unlabelled(self):
         disp = torch.randn(4, 3)
-        m = moa_hierarchy_cosine(disp, ["A", None, "A", ""])
+        m = moa_hierarchy_cosine(disp, ["A", None, "A", ""], n_perm=0)
         # only the two "A" drugs form an intra pair; no inter pairs
         assert m["n_pairs_intra"] == 1
         assert m["n_pairs_inter"] == 0
         assert np.isnan(m["separation"])
+
+    def test_mannwhitney_p(self):
+        # well separated groups -> small p
+        p = mannwhitney_p([5, 6, 7, 8], [0, 1, 2, 3])
+        assert 0.0 <= p < 0.1
+        # overlapping groups -> large p
+        p2 = mannwhitney_p([1, 2, 3, 4], [1, 2, 3, 4])
+        assert p2 > 0.5
+        assert np.isnan(mannwhitney_p([], [1, 2]))
+
+    def test_dose_response_monotonicity(self):
+        dr = dose_response_slope([-8, -7, -6, -5], [0.0, 1.0, 2.0, 3.0])
+        assert dr["monotonicity"] == 1.0  # all steps increase
+        dr2 = dose_response_slope([-8, -7, -6, -5], [3.0, 2.0, 1.0, 0.0])
+        assert dr2["monotonicity"] == 0.0
+
+    def test_cv_axis_scores(self):
+        # linearly separable feature -> CV decision scores rank the classes correctly
+        rng = np.random.default_rng(0)
+        n = 12
+        feats = np.concatenate([
+            rng.normal(2.0, 0.3, (n, 3)),   # positives
+            rng.normal(-2.0, 0.3, (n, 3)),  # negatives
+        ])
+        labels = np.array([1] * n + [0] * n)
+        scores = cv_axis_scores(feats, labels, n_folds=3, seed=0)
+        m = np.isfinite(scores)
+        if m.sum() >= 4:  # sklearn present
+            assert roc_auc(scores[m], labels[m]) > 0.8
+
+
+class TestLabels:
+    def test_dilirank_by_name_case_insensitive(self):
+        assert dili_label_by_name("Acetaminophen") == "hepatotoxic"
+        assert dili_label_by_name("ASPIRIN") == "low_concern"
+        assert dili_label_by_name("not_a_real_drug") is None
+        assert dili_label_by_name(None) is None
+
+    def test_expanded_label_coverage(self):
+        # the broadened DILIrank/LiverTox sets are substantial and disjoint
+        assert len(HEPATOTOX_DRUGS) >= 80
+        assert len(LOW_DILI_DRUGS) >= 60
+        assert not (HEPATOTOX_DRUGS & LOW_DILI_DRUGS)
+
+    def test_weak_moa_label(self):
+        assert weak_dili_label_from_moa("topoisomerase II inhibitor") == "hepatotoxic"
+        assert weak_dili_label_from_moa("histamine receptor antagonist") == "low_concern"
+        assert weak_dili_label_from_moa(None) is None
+        assert weak_dili_label_from_moa("unrelated mechanism") is None
+
+
+class TestFindingsRanking:
+    def test_rank_findings_orders_by_strength(self):
+        results = {
+            "dili": {"best": {
+                "score": "top_shift_mag", "label_source": "dilirank",
+                "roc_auc": 0.95, "auc_strength": 0.45, "balanced_accuracy": 0.9,
+                "n_hepatotoxic": 5, "n_low_concern": 5,
+            }},
+            "moa_hierarchy": {
+                "intra": 0.6, "inter": 0.55, "separation": 0.05, "p_value": 0.3,
+                "n_pairs_intra": 3, "n_pairs_inter": 9,
+            },
+            "accuracy": {"mean_gap_closed": 0.2, "mean_centroid_cosine": 0.8, "n_strata": 10},
+            "coverage": {"n_drugs": 20},
+        }
+        out = _rank_findings(results)
+        assert out["ranked"][0]["analysis"] == "dili_classification"  # strongest
+        assert "DILI AUROC=0.950" in out["headline"]
+        # ranked strictly by descending strength
+        strengths = [f["strength"] for f in out["ranked"]]
+        assert strengths == sorted(strengths, reverse=True)
+
+
+class TestTrajectoryDeviceConsistency:
+    def test_dose_track_cpu_smoke(self):
+        # device-consistency smoke for the trajectory path (CPU): control latents,
+        # action and model all on CPU -> build_dose_track runs without a device error.
+        from eb_jepa.singlecell.perturbator.visualize import build_dose_track
+
+        feat = HepatotoxActionFeaturizer()
+        model = Perturbator(
+            d_model=6, action_dim=feat.action_dim, depth=1, d_cond=8,
+            time_conditioned=True,
+        ).eval()
+        control = torch.randn(16, 6)  # CPU
+        track = build_dose_track(
+            model, feat, control, "acetaminophen", "CCO", [-7.0, -6.0, -5.0],
+            objective="flow_matching", ode_steps=3,
+        )
+        assert track.dose_centroids.shape == (3, 6)
+        assert "score" in track.metrics

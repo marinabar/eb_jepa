@@ -38,7 +38,12 @@ import numpy as np
 import torch
 
 from eb_jepa.logging import get_logger
-from eb_jepa.singlecell.perturbator.hepatotox_features import HepatotoxPathwayFeaturizer
+from eb_jepa.singlecell.perturbator.hepatotox_features import (
+    HEPATOTOX_DRUGS,
+    LOW_DILI_DRUGS,
+    HepatotoxPathwayFeaturizer,
+    dili_label_by_name as _dili_label,
+)
 from eb_jepa.singlecell.probes import (
     run_probe_suite,
     train_classification_probe,
@@ -54,39 +59,10 @@ logger = get_logger(__name__)
 # House style (single source of truth for figures: eb_jepa.singlecell.visualize).
 from eb_jepa.singlecell import visualize as viz
 
-# --------------------------------------------------------------------------- #
-# Curated DILIrank-style hepatotoxic drug list.                               #
-# Source: FDA DILIrank "vMost-DILI-Concern" / LiverTox well-known hepatotoxins #
-# (Chen et al., Drug Discov Today 2016; NIH LiverTox). Lower-cased drug names; #
-# matched against Tahoe's ``drug`` column. EDIT FREELY — this is a small,      #
-# transparent curated set, not an exhaustive label.                           #
-# --------------------------------------------------------------------------- #
-HEPATOTOX_DRUGS = {
-    "acetaminophen", "paracetamol", "troglitazone", "trovafloxacin", "diclofenac",
-    "isoniazid", "ketoconazole", "nefazodone", "tolcapone", "bromfenac",
-    "valproic acid", "amiodarone", "flutamide", "nimesulide", "leflunomide",
-    "tamoxifen", "methotrexate", "rifampicin", "rifampin", "pioglitazone",
-    "rosiglitazone", "bosentan", "felbamate", "dantrolene", "pemoline",
-    "labetalol", "ticlopidine", "carbamazepine", "phenytoin", "erythromycin",
-}
-
-# Drugs with no/low DILI concern (negatives), for a balanced curated probe.
-LOW_DILI_DRUGS = {
-    "aspirin", "ibuprofen", "metformin", "atenolol", "famotidine",
-    "loratadine", "cetirizine", "ranitidine", "lisinopril", "amlodipine",
-    "omeprazole", "simvastatin", "warfarin", "furosemide", "hydrochlorothiazide",
-}
-
-
-def _dili_label(drug: str | None) -> str | None:
-    if not drug:
-        return None
-    d = drug.strip().lower()
-    if d in HEPATOTOX_DRUGS:
-        return "hepatotoxic"
-    if d in LOW_DILI_DRUGS:
-        return "low_concern"
-    return None  # unknown -> excluded from the curated probe
+# The DILIrank / LiverTox label vocabulary (HEPATOTOX_DRUGS / LOW_DILI_DRUGS) and the
+# name-matcher (_dili_label = dili_label_by_name) are imported above from
+# eb_jepa.singlecell.perturbator.hepatotox_features — the single source of truth, so
+# the encoder probe and the perturbator validation share one editable label set.
 
 
 # --------------------------------------------------------------------------- #

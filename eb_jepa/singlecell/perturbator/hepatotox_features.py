@@ -42,6 +42,140 @@ import torch
 
 from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
 
+# =========================================================================== #
+# DILIrank / LiverTox reference label vocabulary (drug-name -> DILI concern).  #
+# =========================================================================== #
+# Primary label source for the perturbator hepatotoxicity validation. Drug
+# names are matched case-insensitively against Tahoe's ``drug`` column.
+#
+# Sources (cited, editable — extend freely):
+#   - FDA DILIrank dataset (Chen et al., Drug Discov Today 2016): "vMost-DILI-
+#     Concern" -> HEPATOTOX_DRUGS (positive), "vNo-DILI-Concern" -> LOW_DILI_DRUGS
+#     (negative). https://www.fda.gov/science-research/liver-toxicity-knowledge-base-ltkb/drug-induced-liver-injury-rank-dilirank-dataset
+#   - NIH LiverTox (https://www.ncbi.nlm.nih.gov/books/NBK547852/): well-described
+#     clinical hepatotoxins / well-tolerated agents.
+# These are clinical DILI labels by parent compound; they intentionally span well
+# beyond Tahoe so the by-name intersection with the liver subset is maximised. The
+# perturbator never sees the label — it predicts a latent shift; the label only
+# scores that shift. Names are lower-cased; INN spellings + common synonyms both
+# listed so the case-insensitive match catches Tahoe naming variants.
+HEPATOTOX_DRUGS: set[str] = {
+    # --- analgesics / NSAIDs (most-DILI-concern) ---
+    "acetaminophen", "paracetamol", "diclofenac", "nimesulide", "bromfenac",
+    "sulindac", "naproxen", "indomethacin", "ibufenac", "benoxaprofen",
+    # --- antibiotics / antifungals / antivirals ---
+    "isoniazid", "rifampicin", "rifampin", "pyrazinamide", "ketoconazole",
+    "trovafloxacin", "telithromycin", "erythromycin", "nitrofurantoin",
+    "flucloxacillin", "minocycline", "nevirapine", "stavudine", "didanosine",
+    "zidovudine", "ritonavir", "tipranavir", "fialuridine", "amoxicillin",
+    "clarithromycin", "azithromycin", "sulfamethoxazole", "voriconazole",
+    "itraconazole", "fluconazole", "terbinafine", "dapsone", "ethionamide",
+    # --- thiazolidinediones / antidiabetics ---
+    "troglitazone", "pioglitazone", "rosiglitazone", "acarbose",
+    # --- CNS / antiepileptics / antidepressants ---
+    "valproic acid", "valproate", "carbamazepine", "phenytoin", "felbamate",
+    "nefazodone", "tolcapone", "pemoline", "duloxetine", "bupropion",
+    "lamotrigine", "phenobarbital", "chlorpromazine", "imipramine",
+    "amineptine", "agomelatine", "disulfiram",
+    # --- cardiovascular ---
+    "amiodarone", "bosentan", "labetalol", "ticlopidine", "hydralazine",
+    "methyldopa", "perhexiline", "dronedarone", "fenofibrate",
+    # --- oncology / immunomodulators ---
+    "tamoxifen", "methotrexate", "flutamide", "leflunomide", "azathioprine",
+    "mercaptopurine", "cytarabine", "dacarbazine", "asparaginase", "imatinib",
+    "lapatinib", "pazopanib", "sunitinib", "sorafenib", "regorafenib",
+    "gefitinib", "erlotinib", "nilotinib", "ponatinib", "bortezomib",
+    "trabectedin", "idelalisib", "crizotinib", "ceritinib", "dasatinib",
+    "axitinib", "vandetanib", "cabozantinib",
+    # --- misc well-known hepatotoxins ---
+    "dantrolene", "halothane", "allopurinol", "interferon", "niacin",
+    "ketoprofen", "tacrine", "zileuton", "etretinate", "acitretin",
+    "danazol", "stanozolol", "methyltestosterone", "cyclophosphamide",
+    "busulfan", "thioguanine", "gemtuzumab",
+}
+
+# vNo-DILI-Concern / well-tolerated agents (negatives).
+LOW_DILI_DRUGS: set[str] = {
+    "aspirin", "ibuprofen", "celecoxib", "metformin", "atenolol", "famotidine",
+    "loratadine", "cetirizine", "fexofenadine", "ranitidine", "lisinopril",
+    "enalapril", "amlodipine", "nifedipine", "omeprazole", "pantoprazole",
+    "lansoprazole", "simvastatin", "pravastatin", "rosuvastatin", "warfarin",
+    "furosemide", "hydrochlorothiazide", "spironolactone", "metoprolol",
+    "propranolol", "losartan", "valsartan", "clopidogrel", "digoxin",
+    "levothyroxine", "gabapentin", "pregabalin", "sertraline", "fluoxetine",
+    "citalopram", "escitalopram", "venlafaxine", "diphenhydramine",
+    "cefalexin", "cephalexin", "penicillin", "doxycycline", "ciprofloxacin",
+    "levofloxacin", "metronidazole", "acyclovir", "oseltamivir", "ondansetron",
+    "metoclopramide", "prednisone", "prednisolone", "dexamethasone",
+    "hydroxychloroquine", "colchicine", "montelukast",
+    "salbutamol", "albuterol", "budesonide", "fluticasone", "insulin",
+    "glipizide", "glyburide", "sitagliptin", "rivaroxaban", "apixaban",
+    "dabigatran", "ezetimibe", "tamsulosin", "finasteride", "sildenafil",
+    "tadalafil", "naratriptan", "sumatriptan", "lorazepam", "diazepam",
+    "zolpidem", "buspirone", "mirtazapine", "tramadol", "morphine",
+    "oxycodone", "codeine", "cyclobenzaprine", "baclofen",
+}
+
+# --------------------------------------------------------------------------- #
+# Weak hepatotoxicity label from drug_metadata MoA / target text (SECONDARY    #
+# label source). Used only when DILIrank-by-name coverage is too thin; reported #
+# separately. Keyed on substrings found in ``moa-broad`` / ``moa-fine`` /       #
+# ``targets`` that map to canonical DILI mechanisms (mitochondrial toxicity,    #
+# reactive-metabolite / oxidative stress, BSEP-mediated cholestasis).           #
+# --------------------------------------------------------------------------- #
+HEPATOTOX_MOA_KEYWORDS: tuple[str, ...] = (
+    "topoisomerase", "dna synthesis", "dna damage", "alkylating",
+    "tyrosine kinase", "kinase inhibitor", "mtor", "proteasome",
+    "cyp", "cytochrome", "mitochond", "oxidative phosphorylation",
+    "hdac", "antimetabolite", "antifolate", "estrogen receptor",
+    "androgen receptor", "retinoic", "statin", "hmg-coa",
+)
+LOW_DILI_MOA_KEYWORDS: tuple[str, ...] = (
+    "antihistamine", "histamine receptor", "beta blocker", "beta-adrenergic",
+    "calcium channel", "ace inhibitor", "angiotensin", "proton pump",
+    "diuretic", "glp-1", "dpp-4",
+)
+
+
+def dili_label_by_name(
+    drug: str | None,
+    hepatotox: set[str] | None = None,
+    low: set[str] | None = None,
+) -> str | None:
+    """Map a Tahoe ``drug`` name to ``"hepatotoxic"`` / ``"low_concern"`` / ``None``.
+
+    Case-insensitive exact-name match against the DILIrank/LiverTox sets above
+    (the primary label source). ``None`` (unknown) drugs are excluded from the
+    DILI probe rather than assumed safe.
+    """
+    if not drug:
+        return None
+    h = hepatotox if hepatotox is not None else HEPATOTOX_DRUGS
+    lo = low if low is not None else LOW_DILI_DRUGS
+    d = drug.strip().lower()
+    if d in h:
+        return "hepatotoxic"
+    if d in lo:
+        return "low_concern"
+    return None
+
+
+def weak_dili_label_from_moa(text: str | None) -> str | None:
+    """Weak DILI label from free-text MoA / target metadata (secondary source).
+
+    Returns ``"hepatotoxic"`` if any high-DILI MoA keyword matches, ``"low_concern"``
+    if a low-DILI keyword matches (and no high-DILI keyword), else ``None``. This is a
+    coarse mechanistic prior, NOT a clinical label — reported as a separate source.
+    """
+    if not text:
+        return None
+    t = str(text).lower()
+    if any(k in t for k in HEPATOTOX_MOA_KEYWORDS):
+        return "hepatotoxic"
+    if any(k in t for k in LOW_DILI_MOA_KEYWORDS):
+        return "low_concern"
+    return None
+
 # --------------------------------------------------------------------------- #
 # Structural-alert SMARTS libraries.                                          #
 # Reused verbatim from virtual-pathway-cyp:                                   #
