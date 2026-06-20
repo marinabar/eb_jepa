@@ -49,9 +49,11 @@ model:
   hierarchical: true
   pathway_membership: /lustre/work/vivatech-unaite/shared/tahoe-cache/pathway_membership.pt
   # hier_positions: [0]      # default: after every gene layer but the last -> [0] for 2 layers
-  # Warm-start from the trained sub14_small encoder (gene body + projector +
-  # count table + [CELL]); the pathway blocks are freshly initialised.
-  warmstart_checkpoint: /lustre/work/vivatech-unaite/ljung/runs/sub14_small/encoder_final.pt
+  # From-scratch by default, for an apples-to-apples comparison against the
+  # sub14_small run (same scale/recipe/steps). To instead warm-start the gene
+  # level from the trained sub14_small encoder (pathway blocks stay fresh), set:
+  #   warmstart_checkpoint: /lustre/work/vivatech-unaite/ljung/runs/sub14/sub14_small/encoder_final.pt
+  warmstart_checkpoint: ""
 
 loss:
   sigreg_weight: 0.4
