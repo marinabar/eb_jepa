@@ -181,6 +181,7 @@ def train(cfg, device=None):
     n_eval = int(cfg.get("eval", {}).get("eval_cells", 0)) if eval_enabled else 0
     sampler = None
     eval_batch = eval_labels = eval_dir = None
+    eval_loss_batch = None  # V-view held-out batch for the eval-set LeJEPA loss
 
     if streaming:
         # init_tahoe_data already shards the stream across rank/workers (no
@@ -217,7 +218,11 @@ def train(cfg, device=None):
             from torch.utils.data import DistributedSampler
 
             sampler = DistributedSampler(
-                train_subset, num_replicas=world, rank=rank, shuffle=True, drop_last=True
+                train_subset,
+                num_replicas=world,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
             )
             train_loader = DataLoader(train_subset, sampler=sampler, **loader_kwargs)
         else:
@@ -229,6 +234,12 @@ def train(cfg, device=None):
 
             eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
             eval_dir = os.path.join(cfg.meta.run_dir, "eval")
+            # V-view held-out batch (same collation as training) -> monitor the LeJEPA
+            # loss on the held-out set (best-eval-loss checkpoint).
+            n_loss = min(int(cfg.eval.get("loss_cells", 128)), len(eval_idx))
+            eval_loss_batch = move_batch(
+                collator([dataset[i] for i in eval_idx[:n_loss]]), device
+            )
             logger.info(
                 f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
             )
@@ -271,7 +282,45 @@ def train(cfg, device=None):
             os.environ["WANDB_ENTITY"] = cfg.wandb.entity  # team; key stays in ~/.netrc
         run = setup_wandb(cfg.wandb.project, cfg, cfg.meta.run_dir, enabled=True)
 
-    def _eval(step: int):
+    # best-checkpoint trackers: save the best encoder for the global (train) loss and
+    # for the held-out eval loss, refreshed at every eval.
+    best = {"train": float("inf"), "eval": float("inf")}
+
+    def _eval_loss():
+        """LeJEPA loss on the held-out V-view batch (same loss as training).
+
+        Rank-0 only -> must NOT advance the shared SIGReg RNG, else the per-rank
+        projection draws desync; save/restore SIGReg.step around the call.
+        """
+        if eval_loss_batch is None:
+            return None
+        sig = raw_module.loss_fn.sigreg
+        saved_step = sig.step
+        was_training = raw_encoder.training
+        raw_encoder.eval()
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=cfg.training.get("amp", True),
+            ),
+        ):
+            out = raw_module.loss_fn(encode_views(raw_encoder, eval_loss_batch))
+        if was_training:
+            raw_encoder.train()
+        sig.step = saved_step  # keep DDP lock-step
+        return {f"eval/{k}": float(v) for k, v in out.items()}
+
+    def _save_best(tag: str, value: float, step: int):
+        save_checkpoint(
+            os.path.join(cfg.meta.run_dir, f"best_{tag}.pt"), raw_encoder, step=step
+        )
+        logger.info(
+            f"  ↳ new best {tag} loss={value:.4f} @ step {step} (best_{tag}.pt)"
+        )
+
+    def _eval(step: int, train_loss: float | None = None):
         from examples.tahoe_jepa.eval_tsne import periodic_eval
 
         metrics, paths = periodic_eval(
@@ -290,16 +339,29 @@ def train(cfg, device=None):
             seed=cfg.meta.seed,
             amp=cfg.training.get("amp", True),
         )
+        eloss = _eval_loss()
+        if eloss is not None:
+            metrics.update(eloss)
+            if run is not None:
+                run.log(eloss, step=step)
         key = {
             k: v
             for k, v in metrics.items()
             if k.endswith(("balanced_accuracy", "r2", "effective_rank"))
+            or k == "eval/loss"
         }
         logger.info(
             f"[eval @ {step}] "
             + " | ".join(f"{k.split('/', 1)[-1]}={v:.3f}" for k, v in key.items())
             + f" -> {len(paths)} t-SNE panels in {eval_dir}"
         )
+        # best-of checkpoints (held-out eval loss + global train loss)
+        if eloss is not None and eloss["eval/loss"] < best["eval"]:
+            best["eval"] = eloss["eval/loss"]
+            _save_best("eval", best["eval"], step)
+        if train_loss is not None and train_loss < best["train"]:
+            best["train"] = train_loss
+            _save_best("train", best["train"], step)
 
     # eval cadence is the SAME on every rank (so all reach the barrier together);
     # only rank 0 actually runs the eval.
@@ -398,8 +460,10 @@ def train(cfg, device=None):
                 if run is not None:
                     run.log(metrics, step=step)
             if eval_every and step % eval_every == 0:
-                if do_eval:  # rank 0 runs probes + t-SNE on the held-out set
-                    _eval(step)
+                if (
+                    do_eval
+                ):  # rank 0 runs probes + t-SNE + eval loss on the held-out set
+                    _eval(step, train_loss=out["loss"].item())
                 if is_ddp:
                     dist.barrier()  # other ranks wait while rank 0 evaluates
             if max_steps and step >= max_steps:
@@ -417,6 +481,11 @@ def train(cfg, device=None):
                 epoch=epoch,
                 step=step,
             )
+    # guaranteed final eval (a clean last scaling-law point) before saving
+    if do_eval and step > 0:
+        _eval(step, train_loss=out["loss"].item())
+    if is_ddp:
+        dist.barrier()
     # always save the final encoder (max_steps/max_minutes stop mid-epoch) so the
     # trained backbone is available for post-hoc probing / t-SNE / scaling laws.
     if is_main(rank):

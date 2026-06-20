@@ -1,0 +1,76 @@
+# Scaling-law base config. The driver (scripts/run_scaling.sh) overrides
+# model.{d_model,n_layers,n_heads,n_kv_heads}, optim.max_steps, training.max_minutes
+# and meta.run_dir per ladder rung. Everything else (data, held-out val split, loss,
+# eval cadence, lambda) is held FIXED across scales so the only varied axis is model
+# size / compute. Shared held-out validation: seed=0 + fixed eval_cells -> identical
+# eval cells across all rungs (comparable held-out LeJEPA loss + probes).
+
+meta:
+  seed: 0
+  run_dir: /data/runs/scaling/base
+
+data:
+  data_dir: /data/tahoe-cache/train
+  split: train
+  L: 4096
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: A
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 32            # per GPU -> global 256 (fixed across scales)
+  num_workers: 6
+  pin_mem: true
+  quantile_bins: /data/tahoe-stats/quantile_bins
+  maps_path: /data/tahoe-cache/maps.pt
+  max_cells: 0
+
+model:
+  d_model: 1024
+  n_layers: 12
+  n_heads: 16
+  n_kv_heads: 4
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 2048
+  proj_dim: 128
+  grad_checkpoint: true      # required at L=4096 (see GPU-saturation finding)
+  compile: false             # off: no warmup eating short budgets; clean FLOP count
+  gene_emb_cache: /data/gene_emb_cache
+
+loss:
+  lamb: 0.02                 # constant across scales (LeJEPA reference; clean scaling)
+  num_slices: 1024
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100                # capped by max_steps / max_minutes
+  max_steps: 1000            # overridden per rung (sizes the cosine schedule + target)
+  lr: 0.002
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+training:
+  amp: true
+  log_every: 10
+  ckpt_every_epoch: false
+  max_minutes: 45            # overridden per rung (hard deadline safety cap)
+
+eval:
+  enabled: true
+  eval_cells: 1024           # held out from SSL training (shared across scales)
+  eval_every: 300            # probes + t-SNE + held-out LeJEPA loss every N steps
+  loss_cells: 128            # V-view batch for the held-out eval loss
+  classes: [organ, cell_line_id, drug, moa_fine]
+  encode_chunk: 128
+  perplexity: 30.0
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld
