@@ -228,18 +228,21 @@ def train(cfg, device=None):
         else:
             train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
 
-        do_eval = is_main(rank) and eval_enabled and n_eval > 0
-        if do_eval:
-            from examples.tahoe_jepa.eval_tsne import build_eval_set
-
-            eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
-            eval_dir = os.path.join(cfg.meta.run_dir, "eval")
-            # V-view held-out batch (same collation as training) -> monitor the LeJEPA
-            # loss on the held-out set (best-eval-loss checkpoint).
+        # V-view held-out batch for the eval LeJEPA loss — built on ALL ranks, because
+        # the loss's SIGReg all-reduces across ranks; a rank-0-only eval-loss would
+        # deadlock (other ranks sit at the barrier, never joining the collective).
+        if eval_enabled and n_eval > 0:
             n_loss = min(int(cfg.eval.get("loss_cells", 128)), len(eval_idx))
             eval_loss_batch = move_batch(
                 collator([dataset[i] for i in eval_idx[:n_loss]]), device
             )
+
+        do_eval = is_main(rank) and eval_enabled and n_eval > 0
+        if do_eval:  # rank 0 owns the probe + t-SNE eval set
+            from examples.tahoe_jepa.eval_tsne import build_eval_set
+
+            eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
+            eval_dir = os.path.join(cfg.meta.run_dir, "eval")
             logger.info(
                 f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
             )
@@ -289,8 +292,9 @@ def train(cfg, device=None):
     def _eval_loss():
         """LeJEPA loss on the held-out V-view batch (same loss as training).
 
-        Rank-0 only -> must NOT advance the shared SIGReg RNG, else the per-rank
-        projection draws desync; save/restore SIGReg.step around the call.
+        Called by ALL ranks (the loss's SIGReg all-reduces -> every rank must join).
+        Save/restore SIGReg.step so the eval doesn't perturb the training projection
+        sequence (all ranks advance+restore identically -> stay lock-step).
         """
         if eval_loss_batch is None:
             return None
@@ -320,7 +324,9 @@ def train(cfg, device=None):
             f"  ↳ new best {tag} loss={value:.4f} @ step {step} (best_{tag}.pt)"
         )
 
-    def _eval(step: int, train_loss: float | None = None):
+    def _eval(step: int, train_loss: float | None, eloss: dict | None):
+        """Rank-0 probes + t-SNE + best-checkpoint logging. ``eloss`` is the global
+        held-out LeJEPA loss already computed collectively by all ranks."""
         from examples.tahoe_jepa.eval_tsne import periodic_eval
 
         metrics, paths = periodic_eval(
@@ -339,7 +345,6 @@ def train(cfg, device=None):
             seed=cfg.meta.seed,
             amp=cfg.training.get("amp", True),
         )
-        eloss = _eval_loss()
         if eloss is not None:
             metrics.update(eloss)
             if run is not None:
@@ -363,8 +368,16 @@ def train(cfg, device=None):
             best["train"] = train_loss
             _save_best("train", best["train"], step)
 
-    # eval cadence is the SAME on every rank (so all reach the barrier together);
-    # only rank 0 actually runs the eval.
+    def _run_eval(step: int, train_loss: float | None = None):
+        # eval loss runs on ALL ranks (collective SIGReg all-reduce -> no deadlock);
+        # probes + t-SNE + checkpoints on rank 0; barrier so the others wait for it.
+        eloss = _eval_loss()
+        if do_eval:
+            _eval(step, train_loss, eloss)
+        if is_ddp:
+            dist.barrier()
+
+    # eval cadence is the SAME on every rank (so all reach the collective together)
     eval_every = (
         int(
             cfg.get("eval", {}).get(
@@ -374,10 +387,7 @@ def train(cfg, device=None):
         if eval_enabled
         else 0
     )
-    if do_eval:
-        _eval(0)  # baseline (random init)
-    if is_ddp:
-        dist.barrier()  # other ranks wait for rank 0's baseline eval
+    _run_eval(0)  # baseline (random init)
 
     # FLOP accounting (trained backbone) + wall-clock budget
     n_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
@@ -460,12 +470,7 @@ def train(cfg, device=None):
                 if run is not None:
                     run.log(metrics, step=step)
             if eval_every and step % eval_every == 0:
-                if (
-                    do_eval
-                ):  # rank 0 runs probes + t-SNE + eval loss on the held-out set
-                    _eval(step, train_loss=out["loss"].item())
-                if is_ddp:
-                    dist.barrier()  # other ranks wait while rank 0 evaluates
+                _run_eval(step, train_loss=out["loss"].item())
             if max_steps and step >= max_steps:
                 stop = True
                 break
@@ -482,10 +487,8 @@ def train(cfg, device=None):
                 step=step,
             )
     # guaranteed final eval (a clean last scaling-law point) before saving
-    if do_eval and step > 0:
-        _eval(step, train_loss=out["loss"].item())
-    if is_ddp:
-        dist.barrier()
+    if step > 0:
+        _run_eval(step, train_loss=out["loss"].item())
     # always save the final encoder (max_steps/max_minutes stop mid-epoch) so the
     # trained backbone is available for post-hoc probing / t-SNE / scaling laws.
     if is_main(rank):
