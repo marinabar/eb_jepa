@@ -40,13 +40,14 @@ export TOKENIZERS_PARALLELISM=false
 cd "${REPO:-$WORK/eb_jepa}"
 export PYTHONPATH=$PWD
 
-echo "=== $(date -u +%T) START $RUN_NAME ngpu=$NGPU steps=${MAX_STEPS:-8000} node=$(hostname) ==="
+CONFIG=${CONFIG:-examples/tahoe_jepa/cfgs/sub14.yaml}
+echo "=== $(date -u +%T) START $RUN_NAME cfg=$CONFIG ngpu=$NGPU steps=${MAX_STEPS:-0} node=$(hostname) ==="
 "$WORK/venv-arm/bin/python" -m torch.distributed.run \
   --standalone --nproc_per_node="$NGPU" \
   -m examples.tahoe_jepa.sub14_main run \
-  --config examples/tahoe_jepa/cfgs/sub14.yaml \
+  --config "$CONFIG" \
   --meta.run_dir "$WORK/runs/sub14/$RUN_NAME" \
   --data.batch_size "${BS:-32}" \
-  --optim.max_steps "${MAX_STEPS:-8000}" \
+  --optim.max_steps "${MAX_STEPS:-0}" \
   --training.max_minutes "${MAX_MIN:-580}"
 echo "=== $(date -u +%T) END $RUN_NAME exit=$? ==="
