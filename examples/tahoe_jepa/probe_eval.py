@@ -79,6 +79,7 @@ def _flatten_probe_results(results: dict) -> dict[str, float]:
             name = full_key[len("clf/") :]
             ba = float(m.get("balanced_accuracy", float("nan")))
             chance = float(m.get("chance", float("nan")))
+            scalars[f"probe/clf/{name}/loss"] = float(m.get("loss", float("nan")))
             scalars[f"probe/clf/{name}/balanced_accuracy"] = ba
             scalars[f"probe/clf/{name}/macro_f1"] = float(
                 m.get("macro_f1", float("nan"))
@@ -87,10 +88,8 @@ def _flatten_probe_results(results: dict) -> dict[str, float]:
             scalars[f"probe/clf/{name}/n_classes"] = float(m.get("n_classes", 0))
         elif full_key.startswith("reg/"):
             name = full_key[len("reg/") :]
+            scalars[f"probe/reg/{name}/loss"] = float(m.get("loss", float("nan")))
             scalars[f"probe/reg/{name}/r2"] = float(m.get("r2", float("nan")))
-            scalars[f"probe/reg/{name}/explained_variance"] = float(
-                m.get("explained_variance", float("nan"))
-            )
     return scalars
 
 
