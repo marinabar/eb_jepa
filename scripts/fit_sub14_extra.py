@@ -118,13 +118,14 @@ def fig_isoflop(runs):
             ax.scatter([xs[j]], [ys[j]], s=180, facecolor="none",
                        edgecolor=c, lw=2.2, zorder=5)
             opt.append((C0, xs[j], ys[j]))
-    if len(opt) >= 2:
+    if len(opt) >= 3:
         oc, op, ol = np.array(opt).T
-        order = np.argsort(op)
-        ax.plot(op[order], ol[order], "--", color=INK, lw=2.4, zorder=6,
-                label="compute-optimal")  # trendline through the minima
-        p = np.polyfit(np.log(oc), np.log(op), 1)[0]
-        ax.text(0.04, 0.06, f"optimal size ∝ C^{p:.2f}", transform=ax.transAxes,
+        pN = np.polyfit(np.log(oc), np.log(op), 1)[0]  # N_opt ∝ C^pN
+        m, b = np.polyfit(np.log(op), np.log(ol), 1)   # smooth power-law fit L_opt ∝ N^m
+        nn = np.geomspace(op.min(), op.max(), 100)
+        ax.plot(nn, np.exp(b) * nn ** m, "--", color=INK, lw=2.6, zorder=6,
+                label=f"compute-optimal\n(N∝C^{pN:.2f})")
+        ax.text(0.04, 0.06, f"optimal size ∝ C^{pN:.2f}", transform=ax.transAxes,
                 color=INK, fontsize=11, fontweight="bold")
     style(ax, "model size (params)", "loss at fixed compute", "IsoFLOP",
           "each curve = one compute budget; ◯ = compute-optimal size", logy=True)
