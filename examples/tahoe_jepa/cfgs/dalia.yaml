@@ -1,0 +1,69 @@
+# LeJEPA on Tahoe-100M — Dalia (GB200) first run.
+# Uses the precomputed gene-embedding cache + mode-B quantile bins, on a diverse
+# subset of shards, with periodic elegant t-SNE snapshots along training.
+
+meta:
+  seed: 0
+  run_dir: /lustre/work/vivatech-unaite/ljung/runs/lejepa_dalia
+
+data:
+  data_dir: /lustre/work/vivatech-unaite/ljung/tahoe-subset   # symlinks to spread-out shards
+  split: train
+  L: 2048
+  n_views: 4
+  view_mode: drop
+  gene_keep_frac: 0.6
+  gene_mask_frac: 0.3
+  count_mode: B
+  n_bins: 64
+  n_genes: 62713
+  batch_size: 32
+  num_workers: 8
+  pin_mem: true
+  quantile_bins: /lustre/work/vivatech-unaite/shared/tahoe-cache/quantile_bins
+  maps_path: /lustre/work/vivatech-unaite/shared/tahoe-cache/maps.pt
+
+model:
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  n_kv_heads: 2
+  use_cls: false
+  readout: meanpool
+  proj_hidden: 1024
+  proj_dim: 128
+  grad_checkpoint: true
+  compile: false
+  gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
+
+loss:
+  lamb: 0.02
+  num_slices: 1024
+  knots: 17
+  t_max: 3.0
+
+optim:
+  epochs: 100
+  max_steps: 6000
+  lr: 0.0015
+  weight_decay: 0.05
+  warmup_ratio: 0.05
+  min_lr: 1.0e-6
+  betas: [0.9, 0.95]
+
+eval:
+  enabled: true
+  tsne_every: 500
+  eval_cells: 2500
+  encode_chunk: 64
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+training:
+  amp: true
+  log_every: 25
+  ckpt_every_epoch: true
+
+wandb:
+  enabled: false
+  project: tahoe-jepa
