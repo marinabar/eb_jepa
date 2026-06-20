@@ -262,6 +262,32 @@ def test_shard_token_values_vectorized(tmp_path):
     assert torch.allclose(torch.from_numpy(vals[: len(g0)]), naive0, atol=1e-5)
 
 
+def test_fit_hist_worker_matches_serial(tmp_path):
+    """Parallel building block: partial histograms over shard slices sum to serial."""
+    import glob as _glob
+
+    import pyarrow.parquet as pq
+
+    from eb_jepa.datasets.tahoe.normalizer import GeneHistogram
+    from eb_jepa.datasets.tahoe.preprocess import _fit_hist_worker, _shard_token_values
+
+    _write_tahoe_layout(tmp_path / "t", n_shards=3)
+    files = sorted(_glob.glob(str(tmp_path / "t" / "data" / "*.parquet")))
+    cols = ["genes", "expressions"]
+    arr, cells = _fit_hist_worker((files, 200, 256, 0.0, 10.0, None, cols))
+
+    ref = GeneHistogram(200, 256, 0.0, 10.0)
+    for f in files:
+        tok, vals, _ = _shard_token_values(pq.read_table(f, columns=cols))
+        ref.update(torch.from_numpy(tok), torch.from_numpy(vals))
+    assert np.array_equal(arr, ref.hist.numpy())
+
+    # round-robin slices summed == single pass over all (order-independent)
+    a0, c0 = _fit_hist_worker((files[0::2], 200, 256, 0.0, 10.0, None, cols))
+    a1, c1 = _fit_hist_worker((files[1::2], 200, 256, 0.0, 10.0, None, cols))
+    assert np.array_equal(a0 + a1, arr) and (c0 + c1) == cells
+
+
 def test_fit_boundaries_from_cells():
     torch.manual_seed(0)
     cells = [

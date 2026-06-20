@@ -214,6 +214,26 @@ def _derive_groups_from_metadata(
     ]
 
 
+def _fit_hist_worker(args):
+    """Worker: accumulate a partial GeneHistogram over a subset of shards.
+
+    Returns (hist_array [vocab, n_hist_bins] int64, n_cells). Module-level so it is
+    picklable for multiprocessing (spawn).
+    """
+    import pyarrow.parquet as pq
+
+    files, vocab, n_hist_bins, v_min, v_max, keep_lines, read_cols = args
+    hist = GeneHistogram(vocab, n_hist_bins=n_hist_bins, v_min=v_min, v_max=v_max)
+    cells = 0
+    for f in files:
+        t = pq.read_table(f, columns=read_cols)
+        tok, vals, n = _shard_token_values(t, keep_lines)
+        if tok.size:
+            hist.update(torch.from_numpy(tok), torch.from_numpy(vals))
+        cells += n
+    return hist.hist.numpy(), cells
+
+
 def fit_stats(
     data_dir: str = "/data/tahoe-100m",
     out_dir: str = "/data/tahoe-stats",
@@ -232,6 +252,7 @@ def fit_stats(
     hist_v_min: float = 0.0,
     hist_v_max: float = 10.0,
     max_shards: int = 0,  # 0 = all shards; else an evenly-spread subset
+    workers: int = 1,  # >1 = parallel histogram over shards (partials summed)
     seed: int = 0,
 ):
     """Compute, ONCE over the whole dataset, the reusable stats: per-gene quantile
@@ -295,17 +316,42 @@ def fit_stats(
     read_cols = ["genes", "expressions"] + (
         ["cell_line_id"] if keep_lines is not None else []
     )
-    hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
-    cells_used, shards_used = 0, 0
-    for f in files:
-        t = pq.read_table(f, columns=read_cols)
-        tok, vals, n_cells = _shard_token_values(t, keep_lines)
-        if tok.size:
-            hist.update(torch.from_numpy(tok), torch.from_numpy(vals))
-        cells_used += n_cells
-        shards_used += 1
-        if quantile_cells > 0 and cells_used >= quantile_cells:
-            break
+    if workers > 1 and len(files) > 1:
+        # Parallel: each worker accumulates a partial histogram over a round-robin
+        # slice of shards (balanced even if shard sizes vary), summed here. The
+        # quantile_cells cap is ignored in parallel mode (process all scanned shards).
+        import multiprocessing as mp
+
+        import numpy as np
+
+        slices = [files[w::workers] for w in range(workers)]
+        tasks = [
+            (s, vocab, n_hist_bins, hist_v_min, hist_v_max, keep_lines, read_cols)
+            for s in slices
+            if s
+        ]
+        with mp.get_context("spawn").Pool(len(tasks)) as pool:
+            results = pool.map(_fit_hist_worker, tasks)
+        total = np.zeros((vocab, n_hist_bins), dtype=np.int64)
+        cells_used = 0
+        for arr, c in results:
+            total += arr
+            cells_used += c
+        hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
+        hist.hist = torch.from_numpy(total)
+        shards_used = len(files)
+    else:
+        hist = GeneHistogram(vocab, n_hist_bins, hist_v_min, hist_v_max)
+        cells_used, shards_used = 0, 0
+        for f in files:
+            t = pq.read_table(f, columns=read_cols)
+            tok, vals, n_cells = _shard_token_values(t, keep_lines)
+            if tok.size:
+                hist.update(torch.from_numpy(tok), torch.from_numpy(vals))
+            cells_used += n_cells
+            shards_used += 1
+            if quantile_cells > 0 and cells_used >= quantile_cells:
+                break
 
     hist.binner(n_bins).save(out / "quantile_bins")
     hist.save(out / "gene_count_histogram")
