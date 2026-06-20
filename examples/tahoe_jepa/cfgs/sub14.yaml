@@ -44,7 +44,7 @@ model:
   attention_activation: sigmoid   # sigmoid | softmax (1.4 winner = sigmoid)
   freeze_features: true
   grad_checkpoint: true
-  compile: true
+  compile: false                  # Dalia/sm_100: matches dalia_full/collapse (no compile)
   # eb_jepa frozen ESMC(protein)+Evo2(DNA) cache, filtered to protein-coding.
   # Set to "random" for a smoke run without the real cache.
   gene_emb_cache: /lustre/work/vivatech-unaite/shared/gene_emb_cache
