@@ -145,9 +145,9 @@ def fit_histogram_from_cells(
 def run(
     data_dir: str = "/data/tahoe-100m",
     out_dir: str = "/data/tahoe-cache",
-    expression_glob: str = "expression_data/**/*.parquet",
-    cell_line_metadata: str = "cell_line_metadata/*.parquet",
-    sample_metadata: str = "sample_metadata/*.parquet",
+    expression_glob: str = "data/*.parquet",
+    cell_line_metadata: str = "metadata/cell_line_metadata.parquet",
+    sample_metadata: str = "metadata/sample_metadata.parquet",
     liver_only: bool = False,
     val_frac: float = 0.1,
     split_by: str = "cell_line_id",
@@ -158,6 +158,7 @@ def run(
     hist_v_min: float = 0.0,
     hist_v_max: float = 10.0,
     subsample: int = 0,
+    max_shards: int = 0,
     seed: int = 0,
 ):
     """Build the cache + split + quantile stats. See module docstring for usage.
@@ -195,6 +196,11 @@ def run(
         raise FileNotFoundError(
             f"No expression parquet under {data_dir}/{expression_glob}"
         )
+    # For a tractable first cache, scan a subset of the (3388) shards spread evenly
+    # across the dataset (stride, not the first N) so all cell lines/drugs appear.
+    if max_shards and max_shards < len(files):
+        stride = len(files) // max_shards
+        files = files[::stride][:max_shards]
 
     # Spread the quantile sample across the whole dataset: keep each cell with
     # probability ~quantile_cells/total so the stats are not biased to head shards.
@@ -211,8 +217,10 @@ def run(
     # streaming per-gene histogram on the sampled cells.
     hist = GeneHistogram(n_genes, n_hist_bins, hist_v_min, hist_v_max)
     group_keys, q_used, kept = set(), 0, 0
+    # dedupe in case split_by == "cell_line_id" (a column can't be requested twice)
+    pass1_cols = list(dict.fromkeys(["genes", "expressions", split_by, "cell_line_id"]))
     for f in files:
-        t = pq.read_table(f, columns=["genes", "expressions", split_by, "cell_line_id"])
+        t = pq.read_table(f, columns=pass1_cols)
         g_acc, v_acc = [], []
         for i in range(t.num_rows):
             cvcl = t.column("cell_line_id")[i].as_py()

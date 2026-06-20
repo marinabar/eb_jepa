@@ -26,10 +26,11 @@ from torch.utils.data import DataLoader, Dataset
 
 from eb_jepa.datasets.tahoe.normalizer import QuantileBinner, cp10k_log1p
 
-# Columns read from expression_data (hyphen in "moa-fine" is intentional).
-_EXPR_COLUMNS = [
-    "genes",
-    "expressions",
+# Per-cell metadata columns (hyphen in "moa-fine" is intentional). The value
+# column is detected per-source: raw expression_data has "expressions" (raw counts
+# with a leading CLS marker); the preprocessed cache has "value" (CP10k+log1p,
+# already CLS-stripped).
+_META_COLUMNS = [
     "drug",
     "sample",
     "cell_line_id",
@@ -115,32 +116,51 @@ class TahoeDataset(Dataset):
         cell_line_to_organ: Optional[dict] = None,
         sample_to_logconc: Optional[dict] = None,
     ):
+        import pyarrow.parquet as pq
+
         self.config = config
         self.binner = binner
         self.cell_line_to_organ = cell_line_to_organ or {}
         self.sample_to_logconc = sample_to_logconc or {}
-        self._table = _read_parquet_dir(config.data_dir, _EXPR_COLUMNS)
+        files = sorted(
+            glob.glob(os.path.join(config.data_dir, "**", "*.parquet"), recursive=True)
+        )
+        if not files:
+            raise FileNotFoundError(f"No parquet files under {config.data_dir!r}")
+        names = set(pq.read_schema(files[0]).names)
+        # cache: pre-normalized, CLS-stripped "value"; raw: "expressions" with CLS.
+        self._cached = "value" in names
+        value_col = "value" if self._cached else "expressions"
+        self._meta_cols = [c for c in _META_COLUMNS if c in names]
+        self._table = _read_parquet_dir(
+            config.data_dir, ["genes", value_col] + self._meta_cols
+        )
         if config.max_cells and config.max_cells < self._table.num_rows:
             self._table = self._table.slice(0, config.max_cells)
         # keep column handles for per-row access
         self._genes = self._table.column("genes")
-        self._expr = self._table.column("expressions")
+        self._value = self._table.column(value_col)
 
     def __len__(self) -> int:
         return self._table.num_rows
 
     def _col(self, name: str, i: int):
+        if name not in self._meta_cols:
+            return None
         return self._table.column(name)[i].as_py()
 
     def __getitem__(self, i: int) -> dict:
-        # strip the CLS marker at position 0 of both aligned arrays
-        token_ids = self._genes[i].values.to_numpy(zero_copy_only=False)[1:]
-        counts = self._expr[i].values.to_numpy(zero_copy_only=False)[1:]
-        token_ids = torch.from_numpy(token_ids.copy()).long()
-        counts = torch.from_numpy(counts.copy()).float()
-        assert token_ids.shape == counts.shape, "genes/expressions misaligned"
+        genes = self._genes[i].values.to_numpy(zero_copy_only=False)
+        vals = self._value[i].values.to_numpy(zero_copy_only=False)
+        if not self._cached:
+            # raw expression_data: strip the CLS marker at position 0 of both
+            genes, vals = genes[1:], vals[1:]
+        token_ids = torch.from_numpy(genes.copy()).long()
+        v = torch.from_numpy(vals.copy()).float()
+        assert token_ids.shape == v.shape, "genes/values misaligned"
 
-        values = cp10k_log1p(counts)  # CP10k + log1p, mode-agnostic
+        # cache already holds CP10k+log1p values; raw counts need the transform
+        values = v if self._cached else cp10k_log1p(v)
         sample = self._col("sample", i)
         cell_line_id = self._col("cell_line_id", i)
         item = {
