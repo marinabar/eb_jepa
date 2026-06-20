@@ -1,0 +1,82 @@
+# Scaling-law base for the Subliminal-1.4 (sub14) recipe — EXACT settings of the
+# winning sub14_small run (sigmoid attention, per-cell quantile-thermometer counts,
+# Muon+AdamW no scheduler, pairwise-cosine JEPA + SIGReg weight 0.4, frozen DNA/protein
+# features). Only the MODEL SIZE is varied by the sweep (scripts/run_sub14_scaling.sh);
+# everything below is held fixed. Paths point at the /data (ovh→gpu 8xB200) cluster.
+#
+# Single-GPU streaming -> the sweep runs one size per GPU IN PARALLEL.
+
+meta:
+  seed: 0
+  run_dir: /data/runs/sub14_scaling/base
+
+data:
+  data_dir: /data/tahoe-cache/train
+  split: train
+  streaming: true
+  shuffle_buffer: 4000
+  batch_size: 32
+  num_workers: 5
+  pin_mem: true
+  max_cells: 0
+  maps_path: /data/tahoe-cache/maps.pt
+  num_bins: 16
+  genes_per_bin: 32           # max_genes_per_cell = 512
+  n_views: 4
+  binomial_subsample:
+    enabled: true
+    p_min: 0.5
+    p_max: 0.9
+
+model:                        # d_model/n_heads/n_layers/d_ff overridden per rung
+  d_model: 256
+  n_heads: 4
+  n_layers: 2
+  d_ff: 1024
+  dropout: 0.1
+  proj_dim: 128
+  attention_activation: sigmoid
+  freeze_features: true
+  grad_checkpoint: false
+  compile: true               # fixed shapes -> compile once, faster steps
+  gene_emb_cache: /data/gene_emb_cache
+
+loss:
+  sigreg_weight: 0.4
+  jepa_loss: cosine
+  sigreg_slices: 256
+  sigreg_knots: 17
+  sigreg_t_max: 3.0
+
+optim:
+  muon_lr: 2.0e-4
+  muon_weight_decay: 0.1
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  adamw_lr: 2.0e-4
+  adamw_weight_decay: 0.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.95
+  adamw_eps: 1.0e-8
+  epochs: 1000
+  max_steps: 0                # uncapped; bounded by training.max_minutes
+  max_grad_norm: 1.0
+
+training:
+  native_bf16: true
+  log_every: 20
+  ckpt_every_steps: 100000    # effectively off during the sweep
+  max_minutes: 35             # overridden by the sweep (shared wall-clock budget)
+
+eval:
+  enabled: true
+  eval_every: 200
+  eval_cells: 1024
+  encode_chunk: 128
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
+wandb:
+  enabled: true
+  entity: unaite
+  project: hacktheworld

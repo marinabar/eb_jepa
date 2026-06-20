@@ -16,6 +16,7 @@ Usage:
     torchrun --nproc_per_node=4 -m examples.tahoe_jepa.sub14_main run \
         --config examples/tahoe_jepa/cfgs/sub14.yaml
 """
+
 from __future__ import annotations
 
 import os
@@ -59,7 +60,9 @@ def is_main(rank: int) -> bool:
 # --------------------------------------------------------------------------- #
 # Loss                                                                        #
 # --------------------------------------------------------------------------- #
-def jepa_pair_loss(view_projections: list[torch.Tensor], kind: str = "cosine") -> torch.Tensor:
+def jepa_pair_loss(
+    view_projections: list[torch.Tensor], kind: str = "cosine"
+) -> torch.Tensor:
     """Average ordered-pair JEPA loss across views (1.4 reference form)."""
     pairs: list[torch.Tensor] = []
     for i in range(len(view_projections)):
@@ -81,6 +84,18 @@ def jepa_pair_loss(view_projections: list[torch.Tensor], kind: str = "cosine") -
 # --------------------------------------------------------------------------- #
 # Build                                                                       #
 # --------------------------------------------------------------------------- #
+def measure_flops(model, gene_ids, bin_ids, pad) -> int:
+    """Forward FLOPs of ONE view through the sub14 model (FlopCounterMode). Training
+    FLOPs/step ≈ 3× (fwd+bwd) × n_views × this — the trained transformer + heads
+    (frozen DNA/protein features add none). Used for the scaling-law FLOP axis."""
+    from torch.utils.flop_counter import FlopCounterMode
+
+    counter = FlopCounterMode(display=False)
+    with torch.no_grad(), counter:
+        model(gene_ids, bin_ids, pad)
+    return counter.get_total_flops()
+
+
 def build_model(cfg, pc, train_dtype, device) -> Subliminal14:
     num_bins = int(cfg.data.get("num_bins", 16))
     genes_per_bin = int(cfg.data.get("genes_per_bin", 32))
@@ -143,7 +158,9 @@ def build_loader(cfg, pc, rank, world):
 # --------------------------------------------------------------------------- #
 # Eval (rank-0 only; no collectives — uses model.encode, not the loss)        #
 # --------------------------------------------------------------------------- #
-def _encode_eval(model, eval_views: dict, device, train_dtype, chunk: int) -> torch.Tensor:
+def _encode_eval(
+    model, eval_views: dict, device, train_dtype, chunk: int
+) -> torch.Tensor:
     """Encode the (single-view) eval batch -> pre-projection reps [N, d]."""
     gene_ids = eval_views["gene_ids"][0]
     bin_ids = eval_views["bin_ids"][0]
@@ -182,7 +199,9 @@ def _eval_loss(model, eval_multi, sigreg, sigreg_weight, jepa_kind, device, loss
     with torch.no_grad():
         projs, sig = [], torch.zeros((), device=device, dtype=torch.float32)
         for vw in range(nv):
-            out = model(g[vw, :n].to(device), b[vw, :n].to(device), p[vw, :n].to(device))
+            out = model(
+                g[vw, :n].to(device), b[vw, :n].to(device), p[vw, :n].to(device)
+            )
             projs.append(out.cell_projection)
             sig = sig + sigreg(out.cell_projection).float()
         jepa = jepa_pair_loss(projs, kind=jepa_kind).float()
@@ -198,33 +217,69 @@ def _eval_loss(model, eval_multi, sigreg, sigreg_weight, jepa_kind, device, loss
     }
 
 
-def run_eval(model, eval_single, eval_meta, eval_multi, sigreg, sigreg_weight, jepa_kind,
-             eval_dir, step, device, train_dtype, run, cfg):
+def run_eval(
+    model,
+    eval_single,
+    eval_meta,
+    eval_multi,
+    sigreg,
+    sigreg_weight,
+    jepa_kind,
+    eval_dir,
+    step,
+    device,
+    train_dtype,
+    run,
+    cfg,
+):
     """Detached probes + per-class t-SNE + held-out loss, logged with the SAME
     wandb keys as the eb_jepa LeJEPA runs (probe/<key>/<metric>, repr/effective_rank,
     tsne/<class>, eval/loss) so sub14 lands in the shared dashboards."""
     from eb_jepa.singlecell.probes import run_probe_suite
-    from eb_jepa.singlecell.visualize import effective_rank, plot_tsne_single, tsne_embed
+    from eb_jepa.singlecell.visualize import (
+        effective_rank,
+        plot_tsne_single,
+        tsne_embed,
+    )
 
-    reps = _encode_eval(model, eval_single, device, train_dtype, int(cfg.eval.get("encode_chunk", 256)))
+    reps = _encode_eval(
+        model, eval_single, device, train_dtype, int(cfg.eval.get("encode_chunk", 256))
+    )
     metrics: dict = {}
     try:
-        suite = run_probe_suite(reps, dict(eval_meta))  # {"clf/organ": {...}, "reg/...": {...}}
+        suite = run_probe_suite(
+            reps, dict(eval_meta)
+        )  # {"clf/organ": {...}, "reg/...": {...}}
         for key, m in suite.items():
             for mk, mv in m.items():
                 metrics[f"probe/{key}/{mk}"] = float(mv)
     except Exception:
         logger.warning("probe suite failed at step %d", step, exc_info=True)
     metrics["repr/effective_rank"] = float(effective_rank(reps))
-    metrics.update(_eval_loss(model, eval_multi, sigreg, sigreg_weight, jepa_kind, device,
-                              int(cfg.eval.get("loss_cells", 128))))
+    metrics.update(
+        _eval_loss(
+            model,
+            eval_multi,
+            sigreg,
+            sigreg_weight,
+            jepa_kind,
+            device,
+            int(cfg.eval.get("loss_cells", 128)),
+        )
+    )
 
     # per-class t-SNE panels (same figures + keys as eb_jepa periodic_eval)
     paths: dict = {}
     try:
         os.makedirs(eval_dir, exist_ok=True)
-        emb = tsne_embed(reps, seed=int(cfg.meta.seed), perplexity=float(cfg.eval.get("perplexity", 30.0)))
-        for c in list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])):
+        emb = tsne_embed(
+            reps,
+            seed=int(cfg.meta.seed),
+            perplexity=float(cfg.eval.get("perplexity", 30.0)),
+        )
+        for c in list(
+            cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])
+        ):
             if c in eval_meta:
                 p = os.path.join(eval_dir, f"tsne_{c}_step{step:06d}.png")
                 plot_tsne_single(emb, eval_meta[c], p, name=c, step=step)
@@ -261,9 +316,16 @@ def build_eval_set(dataset, collator_cls_args, cfg):
     n_eval = int(cfg.eval.get("eval_cells", 0))
     items = dataset.sample_items(n_eval)
     single = Sub14Collator(
-        **collator_cls_args, num_views=1, binomial_subsample=None, seed=int(cfg.meta.seed),
+        **collator_cls_args,
+        num_views=1,
+        binomial_subsample=None,
+        seed=int(cfg.meta.seed),
     )(items)
-    meta = {k: single[k] for k in ("organ", "cell_line_id", "drug", "moa_fine", "sample", "plate") if k in single}
+    meta = {
+        k: single[k]
+        for k in ("organ", "cell_line_id", "drug", "moa_fine", "sample", "plate")
+        if k in single
+    }
     n_loss = max(128, int(cfg.eval.get("loss_cells", 128)))
     multi = Sub14Collator(
         **collator_cls_args,
@@ -280,7 +342,9 @@ def build_eval_set(dataset, collator_cls_args, cfg):
 def train(cfg, device=None):
     is_ddp, rank, world, local_rank = setup_ddp()
     if device is None:
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        device = torch.device(
+            f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+        )
     setup_seed(int(cfg.meta.seed) + rank)
 
     native_bf16 = bool(cfg.training.get("native_bf16", False)) and device.type == "cuda"
@@ -311,9 +375,13 @@ def train(cfg, device=None):
                 f"warmstart_checkpoint not found: {warm}. Stage the trained 1.4 "
                 "checkpoint there first (see scripts/dalia_sub14.sbatch header)."
             )
-        from eb_jepa.singlecell.sub14.load_checkpoint import load_subliminal14_checkpoint
+        from eb_jepa.singlecell.sub14.load_checkpoint import (
+            load_subliminal14_checkpoint,
+        )
 
-        load_subliminal14_checkpoint(model, warm, map_location="cpu", verbose=is_main(rank))
+        load_subliminal14_checkpoint(
+            model, warm, map_location="cpu", verbose=is_main(rank)
+        )
         model = model.to(device=device, dtype=train_dtype)
 
     if bool(cfg.model.get("compile", False)):
@@ -338,7 +406,10 @@ def train(cfg, device=None):
         muon_momentum=float(cfg.optim.get("muon_momentum", 0.95)),
         muon_weight_decay=float(cfg.optim.get("muon_weight_decay", 0.1)),
         muon_ns_steps=int(cfg.optim.get("muon_ns_steps", 5)),
-        adamw_betas=(float(cfg.optim.get("adamw_beta1", 0.9)), float(cfg.optim.get("adamw_beta2", 0.95))),
+        adamw_betas=(
+            float(cfg.optim.get("adamw_beta1", 0.9)),
+            float(cfg.optim.get("adamw_beta2", 0.95)),
+        ),
         adamw_eps=float(cfg.optim.get("adamw_eps", 1e-8)),
         adamw_weight_decay=float(cfg.optim.get("adamw_weight_decay", 0.0)),
     )
@@ -355,7 +426,9 @@ def train(cfg, device=None):
 
     autocast = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if (device.type == "cuda" and not native_bf16 and cfg.training.get("amp", False))
+        if (
+            device.type == "cuda" and not native_bf16 and cfg.training.get("amp", False)
+        )
         else nullcontext()
     )
 
@@ -377,17 +450,34 @@ def train(cfg, device=None):
                 num_bins=int(cfg.data.get("num_bins", 16)),
                 genes_per_bin=int(cfg.data.get("genes_per_bin", 32)),
             )
-            eval_single, eval_meta, eval_multi = build_eval_set(dataset, collator_args, cfg)
+            eval_single, eval_meta, eval_multi = build_eval_set(
+                dataset, collator_args, cfg
+            )
             logger.info(f"eval set: {eval_single['batch_size']} cells -> {eval_dir}")
 
     n_params = sum(p.numel() for p in raw_module.parameters() if p.requires_grad)
     if is_main(rank):
-        logger.info(f"trainable params: {n_params:,} | n_pc_genes={pc.n_pc_genes} | dtype={train_dtype}")
+        logger.info(
+            f"trainable params: {n_params:,} | n_pc_genes={pc.n_pc_genes} | dtype={train_dtype}"
+        )
 
     def _eval(step):
         if is_main(rank) and eval_single is not None:
-            run_eval(raw_module, eval_single, eval_meta, eval_multi, sigreg, sigreg_weight,
-                     jepa_kind, eval_dir, step, device, train_dtype, run, cfg)
+            run_eval(
+                raw_module,
+                eval_single,
+                eval_meta,
+                eval_multi,
+                sigreg,
+                sigreg_weight,
+                jepa_kind,
+                eval_dir,
+                step,
+                device,
+                train_dtype,
+                run,
+                cfg,
+            )
         if is_ddp:
             dist.barrier()
 
@@ -395,15 +485,26 @@ def train(cfg, device=None):
         if not is_main(rank):
             return
         os.makedirs(cfg.meta.run_dir, exist_ok=True)
-        state = {k.replace("_orig_mod.", "", 1): v for k, v in raw_module.state_dict().items()}
+        state = {
+            k.replace("_orig_mod.", "", 1): v
+            for k, v in raw_module.state_dict().items()
+        }
         torch.save(
-            {"model": state, "optimizer": opt.state_dict(), "step": step, "n_pc_genes": pc.n_pc_genes},
+            {
+                "model": state,
+                "optimizer": opt.state_dict(),
+                "step": step,
+                "n_pc_genes": pc.n_pc_genes,
+            },
             os.path.join(cfg.meta.run_dir, f"{tag}.pt"),
         )
         logger.info(f"  -> saved {tag}.pt @ step {step}")
 
     _eval(0)  # baseline (random init)
 
+    # FLOP accounting (trained parts): fwd measured once, fwd+bwd ~3x over V views.
+    flops_per_step = None
+    cumulative_flops = 0.0
     loop_start = time.time()
     step = 0
     stop = False
@@ -418,6 +519,19 @@ def train(cfg, device=None):
             bin_ids = batch["bin_ids"].to(device, non_blocking=True)
             pad = batch["padding_mask"].to(device, non_blocking=True)
             n_views = int(batch["n_views"])
+            if flops_per_step is None:
+                fwd = measure_flops(raw_module, gene_ids[0], bin_ids[0], pad[0])
+                gfwd = fwd
+                if is_ddp:
+                    t = torch.tensor(float(fwd), device=device)
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                    gfwd = t.item()
+                # fwd+bwd (~3x) over V views, summed across ranks = global FLOPs/step
+                flops_per_step = 3.0 * n_views * gfwd
+                if is_main(rank):
+                    logger.info(
+                        f"fwd FLOPs/view={fwd:.3e} | train FLOPs/step={flops_per_step:.3e} | params={n_params:,}"
+                    )
 
             opt.zero_grad(set_to_none=True)
             with autocast:
@@ -436,22 +550,33 @@ def train(cfg, device=None):
                 torch.nn.utils.clip_grad_norm_(raw_module.parameters(), max_grad_norm)
             opt.step()
             step += 1
+            cumulative_flops += flops_per_step
 
             if is_main(rank) and step % log_every == 0:
                 elapsed = max(time.time() - loop_start, 1e-9)
                 cells = step * int(cfg.data.batch_size) * world
-                g_per_view = int(cfg.data.get("num_bins", 16)) * int(cfg.data.get("genes_per_bin", 32))
+                g_per_view = int(cfg.data.get("num_bins", 16)) * int(
+                    cfg.data.get("genes_per_bin", 32)
+                )
                 # Same metric keys as the eb_jepa LeJEPA runs so sub14 shares the
-                # dashboards: loss / invariance_loss / sigreg_loss / lr / data,throughput.
+                # dashboards: loss / invariance_loss / sigreg_loss / lr / data,throughput
+                # + FLOPs/params for the scaling laws.
                 m = {
                     "loss": float(loss.detach().item()),
                     "invariance_loss": float(jepa.detach().item()),
                     "sigreg_loss": float(sigreg_avg.detach().item()),
-                    "lr": float(cfg.optim.get("adamw_lr", 2e-4)),  # constant (no scheduler)
+                    "lr": float(
+                        cfg.optim.get("adamw_lr", 2e-4)
+                    ),  # constant (no scheduler)
                     "epoch": epoch,
                     "data/cells_seen": cells,
                     "data/tokens_seen": cells * n_views * g_per_view,
                     "throughput/cells_per_s": cells / elapsed,
+                    "model/trainable_params": n_params,
+                    "flops/per_step_global": flops_per_step,
+                    "flops/cumulative": cumulative_flops,
+                    "flops/pflops_cumulative": cumulative_flops / 1e15,
+                    "flops/tflops_per_s": (cumulative_flops / 1e12) / elapsed,
                 }
                 logger.info(
                     f"step {step} | loss={m['loss']:.4f} inv={m['invariance_loss']:.4f} "
