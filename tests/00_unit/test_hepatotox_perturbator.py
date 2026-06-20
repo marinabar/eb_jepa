@@ -3,11 +3,17 @@
 CPU, tiny dims, no rdkit required (the featurizers fall back to a deterministic hash).
 """
 
+import os
+
 import numpy as np
 import torch
 
 from eb_jepa.singlecell.perturbator.featurize import DrugFeaturizer
-from eb_jepa.singlecell.perturbator.flow import flow_matching_loss, predict_perturbed
+from eb_jepa.singlecell.perturbator.flow import (
+    flow_matching_loss,
+    ode_sample,
+    predict_perturbed,
+)
 from eb_jepa.singlecell.perturbator.hepatotox_features import (
     HEPATOTOX_DRUGS,
     LOW_DILI_DRUGS,
@@ -109,6 +115,27 @@ class TestFlowWithHepatotoxAction:
         action = feat.featurize("CCO", -6.0)
         out = predict_perturbed(model, src, action, "flow_matching", n_steps=4)
         assert out.shape == (9, 6)
+
+    def test_ode_sample_return_path(self):
+        # return_path yields [n_steps+1, N, d]; path[0]==source, path[-1]==final;
+        # and the final state is byte-identical to the default (no return_path) call.
+        feat = HepatotoxActionFeaturizer()
+        model = Perturbator(
+            d_model=5, action_dim=feat.action_dim, depth=2, d_cond=8,
+            time_conditioned=True,
+        ).eval()
+        src = torch.randn(11, 5)
+        action = feat.featurize("CCO", -6.0)
+        steps = 7
+        for method in ("euler", "heun", "midpoint"):
+            final_only = ode_sample(model, src, action, n_steps=steps, method=method)
+            final, path = ode_sample(
+                model, src, action, n_steps=steps, method=method, return_path=True
+            )
+            assert path.shape == (steps + 1, 11, 5)
+            assert torch.equal(path[0], src)          # path starts at the source
+            assert torch.equal(path[-1], final)       # path ends at the final state
+            assert torch.equal(final, final_only)     # default behaviour byte-identical
 
 
 class TestValidationHelpers:
@@ -259,6 +286,47 @@ class TestFindingsRanking:
         # ranked strictly by descending strength
         strengths = [f["strength"] for f in out["ranked"]]
         assert strengths == sorted(strengths, reverse=True)
+
+
+class TestFlowFieldFigure:
+    def test_projection_and_plot_smoke(self, tmp_path):
+        # synthetic control / treated / predicted clouds + a recorded flow path ->
+        # PCA(2) projection + plot_flow_field writes PNG/PDF/SVG without error.
+        import matplotlib
+        matplotlib.use("Agg")
+        from examples.tahoe_hepatotox.flow_field import plot_flow_field
+
+        rng = np.random.default_rng(0)
+        d, nc, nt, steps = 6, 40, 30, 5
+        ctrl = rng.normal(0.0, 1.0, (nc, d))
+        real = rng.normal(2.0, 1.0, (nt, d))
+        # linear flow path control -> ~real centroid (straight lines)
+        target_dir = real.mean(0) - ctrl.mean(0)
+        ts = np.linspace(0.0, 1.0, steps + 1)
+        path = np.stack([ctrl + t * target_dir for t in ts], 0)  # [T+1, nc, d]
+        pred = path[-1]
+
+        # PCA(2) on (control ∪ real), faithful linear map
+        fit = np.concatenate([ctrl, real], 0)
+        mu = fit.mean(0, keepdims=True)
+        _, _, Vt = np.linalg.svd(fit - mu, full_matrices=False)
+        comp = Vt[:2].T
+
+        def proj(x):
+            return (x - mu) @ comp
+
+        paths2d = proj(path.reshape(-1, d)).reshape(steps + 1, nc, 2)
+        choice = {"drug": "Dabrafenib", "cell_line": "CVCL_0027", "dose": -5.5,
+                  "n_control": nc, "n_treated": nt}
+        metrics = {"sliced_w_pred": 0.4, "sliced_w_base": 1.2, "gap_closed": 0.67,
+                   "shift_cosine": 0.95}
+        out_prefix = str(tmp_path / "flow_smoke")
+        paths = plot_flow_field(proj(ctrl), proj(real), proj(pred), paths2d,
+                                choice, metrics, out_prefix, n_streamlines=20, seed=0)
+        assert any(p.endswith(".png") for p in paths)
+        assert any(p.endswith(".svg") for p in paths)
+        for p in paths:
+            assert os.path.exists(p)
 
 
 class TestTrajectoryDeviceConsistency:

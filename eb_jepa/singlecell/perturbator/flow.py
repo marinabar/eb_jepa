@@ -78,7 +78,8 @@ def ode_sample(
     method: str = "heun",
     t0: float = 0.0,
     t1: float = 1.0,
-) -> torch.Tensor:
+    return_path: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Integrate ``dx/dt = v_theta(x, t, action)`` from ``t0`` to ``t1``.
 
     Args:
@@ -88,8 +89,12 @@ def ode_sample(
         n_steps: number of fixed integration steps.
         method: ``"euler"`` (1st order) or ``"heun"`` / ``"midpoint"`` (2nd order).
         t0, t1: integration interval (default the full path ``[0, 1]``).
+        return_path: if True, also return the full integrated path
+            ``[n_steps + 1, N, d]`` — the state at every integration time
+            ``t0 .. t1`` (``path[0] == source``, ``path[-1] == final state``).
     Returns:
-        ``[N, d]`` predicted perturbed latents (the state at ``t1``).
+        ``[N, d]`` predicted perturbed latents (the state at ``t1``); or, when
+        ``return_path``, the tuple ``(final [N, d], path [n_steps + 1, N, d])``.
 
     With ``method="euler"`` and ``n_steps=1`` over ``[0, 1]`` this reduces to a single
     Euler step ``source + v(source, 0)`` — the direct one-shot prediction.
@@ -100,6 +105,7 @@ def ode_sample(
     n_steps = max(1, int(n_steps))
     dt = (t1 - t0) / n_steps
     x = source
+    path = [x] if return_path else None
     for i in range(n_steps):
         t = t0 + i * dt
         t_vec = torch.full((x.shape[0],), float(t), device=x.device, dtype=x.dtype)
@@ -119,6 +125,10 @@ def ode_sample(
             )
             x_mid = x + 0.5 * dt * v
             x = x + dt * model.velocity(x_mid, t_mid, action)
+        if return_path:
+            path.append(x)
+    if return_path:
+        return x, torch.stack(path, dim=0)  # [n_steps + 1, N, d]
     return x
 
 
