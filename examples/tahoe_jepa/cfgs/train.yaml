@@ -50,8 +50,10 @@ optim:
   betas: [0.9, 0.95]
 
 eval:
-  enabled: false         # periodic t-SNE snapshots of the pre-projection latent
-  tsne_every: 500        # steps (a snapshot is also taken at step 0)
+  enabled: false         # periodic t-SNE snapshots + detached-probe diagnostics
+  tsne_every: 500        # steps (a snapshot is also taken at step 0); 0 = off
+  probe_every: 500       # steps: detached probes + collapse diagnostics; 0 = off
+  probe_epochs: 150      # linear-probe training length (smaller = faster eval)
   eval_cells: 2000       # fixed seeded subset encoded for each snapshot
   encode_chunk: 64
   perplexity: 30.0

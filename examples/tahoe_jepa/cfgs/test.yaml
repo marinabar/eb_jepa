@@ -51,6 +51,16 @@ optim:
   min_lr: 1.0e-6
   betas: [0.9, 0.95]
 
+eval:
+  enabled: true          # exercise t-SNE snapshots + detached-probe diagnostics
+  tsne_every: 200         # steps (a snapshot is also taken at step 0); 0 = off
+  probe_every: 200        # steps: detached probes + collapse diagnostics; 0 = off
+  probe_epochs: 30        # short probe training for the fast test run
+  eval_cells: 512
+  encode_chunk: 64
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
+
 training:
   amp: true
   log_every: 10
