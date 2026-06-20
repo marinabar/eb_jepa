@@ -123,6 +123,11 @@ def _make_item(genes, vals, cached, meta, binner, cell_line_to_organ, sample_to_
     item = {
         "gene_token_ids": token_ids,
         "values": values,
+        # Raw integer UMI counts (pre-normalization), kept for binomial-count
+        # subsampling (Subliminal-1.4-style views). For preprocessed caches the
+        # raw counts are gone, so fall back to the normalized values (binomial
+        # subsample on a cache is then a no-op / rank-preserving best effort).
+        "raw_counts": v if not cached else values,
         "drug": meta.get("drug"),
         "sample": sample,
         "cell_line_id": cell_line_id,
