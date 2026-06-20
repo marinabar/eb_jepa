@@ -147,7 +147,7 @@ class TestPeriodicEval:
             n_layers=2,
             n_heads=4,
         )
-        metrics, path = periodic_eval(
+        metrics, paths = periodic_eval(
             enc,
             eval_batch,
             labels,
@@ -162,7 +162,9 @@ class TestPeriodicEval:
         assert any(k.startswith("probe/clf/") for k in metrics)
         assert "probe/reg/gene_count/r2" in metrics
         assert "repr/effective_rank" in metrics
-        assert os.path.exists(path)
+        # periodic_eval returns one t-SNE image path per class
+        assert set(paths) == {"organ", "cell_line_id"}
+        assert all(os.path.exists(p) for p in paths.values())
 
 
 class TestVisualize:
