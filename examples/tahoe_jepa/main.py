@@ -156,6 +156,18 @@ def train(cfg, device=None):
         sample_to_logconc=maps.get("sample_to_logconc"),
     )
 
+    # fixed eval set for t-SNE snapshots along training (rank 0 only)
+    eval_batch = eval_labels = tsne_dir = None
+    do_tsne = is_main(rank) and bool(cfg.get("eval", {}).get("enabled", False))
+    if do_tsne:
+        from examples.tahoe_jepa.eval_tsne import build_eval_set
+
+        eval_batch, eval_labels = build_eval_set(
+            dataset, data_cfg, int(cfg.eval.get("eval_cells", 2000)), seed=cfg.meta.seed
+        )
+        tsne_dir = os.path.join(cfg.meta.run_dir, "tsne")
+        logger.info(f"t-SNE eval set: {len(eval_labels['organ'])} cells -> {tsne_dir}")
+
     # model
     model = build_train_module(cfg).to(device)
     if cfg.model.get("compile", False):
@@ -188,8 +200,30 @@ def train(cfg, device=None):
             os.environ["WANDB_ENTITY"] = cfg.wandb.entity  # team; key stays in ~/.netrc
         run = setup_wandb(cfg.wandb.project, cfg, cfg.meta.run_dir, enabled=True)
 
+    def _snapshot(step: int):
+        from examples.tahoe_jepa.eval_tsne import tsne_snapshot
+
+        enc = model.module.encoder if is_ddp else model.encoder
+        path = tsne_snapshot(
+            enc, eval_batch, eval_labels, tsne_dir, step, device,
+            classes=list(cfg.eval.get("classes", ["organ", "cell_line_id", "drug", "moa_fine"])),
+            chunk=int(cfg.eval.get("encode_chunk", 64)),
+            perplexity=float(cfg.eval.get("perplexity", 30.0)),
+            seed=cfg.meta.seed,
+            amp=cfg.training.get("amp", True),
+        )
+        logger.info(f"t-SNE snapshot @ step {step} -> {path}")
+
+    max_steps = int(cfg.optim.get("max_steps", 0))
+    tsne_every = int(cfg.get("eval", {}).get("tsne_every", 0)) if do_tsne else 0
+    if do_tsne:
+        _snapshot(0)  # baseline (random init)
+
     step = 0
+    stop = False
     for epoch in range(cfg.optim.epochs):
+        if stop:
+            break
         model.train()
         for batch in train_loader:
             batch = move_batch(batch, device)
@@ -213,6 +247,11 @@ def train(cfg, device=None):
                 )
                 if run is not None:
                     run.log(metrics, step=step)
+            if tsne_every and step % tsne_every == 0:
+                _snapshot(step)
+            if max_steps and step >= max_steps:
+                stop = True
+                break
         if is_main(rank) and cfg.training.get("ckpt_every_epoch", True):
             enc = model.module.encoder if is_ddp else model.encoder
             save_checkpoint(

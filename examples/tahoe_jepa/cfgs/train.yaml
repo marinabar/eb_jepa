@@ -42,11 +42,20 @@ loss:
 
 optim:
   epochs: 100
+  max_steps: 0           # >0 caps total optimizer steps (otherwise epochs*len(loader))
   lr: 0.002
   weight_decay: 0.05
   warmup_ratio: 0.05
   min_lr: 1.0e-6
   betas: [0.9, 0.95]
+
+eval:
+  enabled: false         # periodic t-SNE snapshots of the pre-projection latent
+  tsne_every: 500        # steps (a snapshot is also taken at step 0)
+  eval_cells: 2000       # fixed seeded subset encoded for each snapshot
+  encode_chunk: 64
+  perplexity: 30.0
+  classes: [organ, cell_line_id, drug, moa_fine]
 
 training:
   amp: true              # bf16 autocast
