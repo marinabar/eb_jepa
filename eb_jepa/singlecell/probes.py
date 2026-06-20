@@ -80,7 +80,7 @@ def train_classification_probe(
     val_frac: float = 0.2,
     seed: int = 0,
     C: float = 1.0,
-    max_iter: int = 2000,
+    max_iter: int = 300,
 ):
     """Linear logistic-regression probe fit **to convergence** (sklearn lbfgs) — the
     optimum of the convex problem, NOT fixed-budget SGD, so the metric isn't biased
