@@ -65,5 +65,6 @@ training:
   ckpt_every_epoch: true
 
 wandb:
-  enabled: false
-  project: tahoe-jepa
+  enabled: true
+  entity: unaite          # team; auth via `wandb login` (~/.netrc), never commit the key
+  project: hacktheworld
