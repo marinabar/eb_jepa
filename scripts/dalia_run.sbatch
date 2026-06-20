@@ -23,7 +23,9 @@ export WANDB_RUN_GROUP=${WANDB_RUN_GROUP:-collapse}
 export WANDB_NAME=$RUN_NAME
 export WANDB_ENTITY=unaite
 
-cd "$WORK/eb_jepa-repo"
+# Run from an isolated worktree of the feature branch (the shared eb_jepa-repo main
+# worktree has unrelated uncommitted local work — left untouched).
+cd "${REPO:-$WORK/eb_jepa-sweep}"
 export PYTHONPATH=$PWD
 
 # pathway run: append the pathway-token flags (50 hallmark tokens + membership cache)

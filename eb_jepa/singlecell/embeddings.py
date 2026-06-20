@@ -29,7 +29,9 @@ class CountEmbedding(nn.Module):
       is the MASK bin (the collator sets masked positions to ``n_bins``).
     """
 
-    def __init__(self, d_model: int, count_mode: str = "A", n_bins: int = 64):
+    def __init__(
+        self, d_model: int, count_mode: str = "A", n_bins: int = 64, use_mask: bool = True
+    ):
         super().__init__()
         assert count_mode in ("A", "B")
         self.count_mode = count_mode
@@ -38,7 +40,14 @@ class CountEmbedding(nn.Module):
             self.mlp = nn.Sequential(
                 nn.Linear(1, d_model), nn.GELU(), nn.Linear(d_model, d_model)
             )
-            self.mask_vector = nn.Parameter(torch.zeros(d_model))
+            # The learned MASK vector exists only where counts can be hidden (gene
+            # mask-views). Pathway counts are never count-masked (their token is
+            # dropped via the attention mask), so use_mask=False keeps the param out
+            # of the graph — otherwise it is an unused parameter that aborts DDP
+            # (find_unused_parameters=False) on the first backward.
+            self.mask_vector = (
+                nn.Parameter(torch.zeros(d_model)) if use_mask else None
+            )
         else:
             self.table = nn.Embedding(n_bins + 1, d_model)  # +1 = MASK bin
 
@@ -50,7 +59,7 @@ class CountEmbedding(nn.Module):
     ) -> torch.Tensor:
         if self.count_mode == "A":
             emb = self.mlp(count_value.unsqueeze(-1))  # [..., d_model]
-            if count_mask is not None:
+            if count_mask is not None and self.mask_vector is not None:
                 emb = torch.where(count_mask.unsqueeze(-1), self.mask_vector, emb)
             return emb
         return self.table(count_bin)  # masked positions already carry bin == n_bins
@@ -79,7 +88,8 @@ class PathwayEmbedding(nn.Module):
         self.n_pathways = n_pathways
         self.identity = nn.Embedding(n_pathways, d_model)
         nn.init.trunc_normal_(self.identity.weight, std=0.02)
-        self.count_emb = CountEmbedding(d_model, count_mode="A")
+        # pathway counts are never count-masked -> no mask vector (DDP-safe)
+        self.count_emb = CountEmbedding(d_model, count_mode="A", use_mask=False)
 
     def forward(self, pathway_count: torch.Tensor) -> torch.Tensor:
         """pathway_count: [..., P] -> pathway token embeddings [..., P, d_model]."""

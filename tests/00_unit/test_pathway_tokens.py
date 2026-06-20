@@ -129,6 +129,17 @@ class TestPathwayEncoder:
         reps.sum().backward()
         assert enc.pathway_embed.identity.weight.grad is not None
 
+    def test_no_unused_params_under_backward(self):
+        # DDP (find_unused_parameters=False) aborts if any trainable param's grad hook
+        # never fires. The pathway count head must NOT carry an unused mask_vector.
+        cfg = _cfg(n_views=2)
+        enc = _build()
+        assert enc.pathway_embed.count_emb.mask_vector is None
+        reps = encode_views(enc, _collate(cfg, n=6, membership=_membership()))
+        reps.sum().backward()
+        unused = [n for n, p in enc.named_parameters() if p.requires_grad and p.grad is None]
+        assert unused == [], f"unused params would crash DDP: {unused}"
+
     def test_disabled_pathways_no_pathway_module(self):
         enc = _build(n_pathways=0)
         assert enc.pathway_embed is None
@@ -150,3 +161,41 @@ class TestPathwayEmbedding:
         pcount = torch.rand(4, P) * 5
         out = pe(pcount)
         assert out.shape == (4, P, D_MODEL) and torch.isfinite(out).all()
+
+
+class _InMemDataset:
+    """Minimal index dataset of pre-made cells for build_eval_set."""
+
+    def __init__(self, n):
+        self.cells = [_cell(5 + i) for i in range(n)]
+
+    def __len__(self):
+        return len(self.cells)
+
+    def __getitem__(self, i):
+        return self.cells[i]
+
+
+class TestPathwayEval:
+    def test_build_eval_set_and_encode_thread_pathways(self):
+        # Regression for the two critical eval bugs: build_eval_set must not crash with
+        # use_pathways=True (membership threaded) and encode_eval must forward pathway
+        # tokens so the eval representation matches the trained (pathways-on) forward.
+        from examples.tahoe_jepa.eval_tsne import build_eval_set, encode_eval
+
+        cfg = _cfg(n_views=4)
+        ds = _InMemDataset(12)
+        enc = _build().eval()
+        dev = torch.device("cpu")
+        batch, labels = build_eval_set(
+            ds, cfg, idx=list(range(12)), membership=_membership()
+        )
+        assert "pathway_count" in batch and batch["pathway_mask"].all()  # drop_frac=0
+        reps = encode_eval(enc, batch, dev, chunk=8, amp=False)
+        assert reps.shape == (12, D_MODEL) and torch.isfinite(reps).all()
+        # eval rep must reflect pathway context: drop the pathway tensors -> differs
+        gene_only = dict(batch)
+        gene_only.pop("pathway_count")
+        gene_only.pop("pathway_mask")
+        reps_off = encode_eval(enc, gene_only, dev, chunk=8, amp=False)
+        assert not torch.allclose(reps, reps_off, atol=1e-4)

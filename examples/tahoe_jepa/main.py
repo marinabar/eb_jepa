@@ -198,7 +198,8 @@ def train(cfg, device=None):
             from examples.tahoe_jepa.eval_tsne import build_eval_set
 
             eval_batch, eval_labels = build_eval_set(
-                dataset, data_cfg, n_eval, seed=cfg.meta.seed
+                dataset, data_cfg, n_eval, seed=cfg.meta.seed,
+                membership=collator.membership,
             )
             eval_dir = os.path.join(cfg.meta.run_dir, "eval")
             logger.info(f"streaming eval set: {n_eval} cells -> {eval_dir}")
@@ -237,17 +238,23 @@ def train(cfg, device=None):
         # V-view held-out batch for the eval LeJEPA loss — built on ALL ranks, because
         # the loss's SIGReg all-reduces across ranks; a rank-0-only eval-loss would
         # deadlock (other ranks sit at the barrier, never joining the collective).
+        # Each rank takes a DISJOINT shard of the (seeded, rank-identical) held-out
+        # set so the all-reduced SIGReg sees a true global batch of loss_cells*world
+        # distinct cells, not the same loss_cells replicated across ranks.
         if eval_enabled and n_eval > 0:
-            n_loss = min(int(cfg.eval.get("loss_cells", 128)), len(eval_idx))
+            loss_shard = eval_idx[rank::world]
+            n_loss = min(int(cfg.eval.get("loss_cells", 128)), len(loss_shard))
             eval_loss_batch = move_batch(
-                collator([dataset[i] for i in eval_idx[:n_loss]]), device
+                collator([dataset[i] for i in loss_shard[:n_loss]]), device
             )
 
         do_eval = is_main(rank) and eval_enabled and n_eval > 0
         if do_eval:  # rank 0 owns the probe + t-SNE eval set
             from examples.tahoe_jepa.eval_tsne import build_eval_set
 
-            eval_batch, eval_labels = build_eval_set(dataset, data_cfg, idx=eval_idx)
+            eval_batch, eval_labels = build_eval_set(
+                dataset, data_cfg, idx=eval_idx, membership=collator.membership
+            )
             eval_dir = os.path.join(cfg.meta.run_dir, "eval")
             logger.info(
                 f"held-out eval: {len(eval_idx)} cells | SSL train: {len(train_idx)} -> {eval_dir}"
