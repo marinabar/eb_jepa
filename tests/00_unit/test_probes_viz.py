@@ -99,9 +99,8 @@ class TestProbes:
         feats, meta = extract_features(enc, loader, device="cpu")
         assert feats.shape == (16, 32)
         assert "organ" in meta and len(meta["organ"]) == 16
-        assert "gene_count" in meta and len(meta["gene_count"]) == 16
         results = run_probe_suite(feats, meta)
-        assert "clf/organ" in results and "reg/gene_count" in results
+        assert "clf/organ" in results  # gene_count probe removed (trivial = depth)
 
     def test_suite_new_targets(self):
         feats, _ = _separable(n_per=30, n_classes=2)  # 60 cells
@@ -195,7 +194,6 @@ class TestPeriodicEval:
             perplexity=10.0,
         )
         assert any(k.startswith("probe/clf/") for k in metrics)
-        assert "probe/reg/gene_count/r2" in metrics
         assert "repr/effective_rank" in metrics
         # periodic_eval returns one t-SNE image path per class
         assert set(paths) == {"organ", "cell_line_id"}

@@ -65,7 +65,6 @@ def _build_meta(eval_batch: dict) -> dict:
     for key in _CLASSES:
         if key in eval_batch:
             meta[key] = list(eval_batch[key])
-    meta["gene_count"] = eval_batch["pad_mask"][0].sum(-1).cpu().tolist()
     if eval_batch.get("log_conc") is not None:
         meta["log_conc"] = eval_batch["log_conc"].cpu().tolist()
     return meta

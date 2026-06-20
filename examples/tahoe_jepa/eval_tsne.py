@@ -99,9 +99,7 @@ def periodic_eval(
     from eb_jepa.singlecell.visualize import effective_rank
 
     reps = encode_eval(encoder, eval_batch, device, chunk, amp)
-    meta = dict(labels)
-    meta["gene_count"] = eval_batch["pad_mask"][0].sum(-1).tolist()
-    suite = run_probe_suite(reps, meta)
+    suite = run_probe_suite(reps, dict(labels))
 
     metrics = {}
     for key, m in suite.items():  # key e.g. "clf/organ" or "reg/gene_count"

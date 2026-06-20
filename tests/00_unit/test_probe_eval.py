@@ -33,8 +33,13 @@ def _cell(i):
 def _eval_batch(n=24):
     # single clean full-gene view, exactly like eval_tsne.build_eval_set
     cfg = TahoeConfig(
-        data_dir="", L=16, n_views=1, n_genes=50, view_mode="drop",
-        gene_keep_frac=1.0, gene_mask_frac=0.0,
+        data_dir="",
+        L=16,
+        n_views=1,
+        n_genes=50,
+        view_mode="drop",
+        gene_keep_frac=1.0,
+        gene_mask_frac=0.0,
     )
     coll = TahoeCollator(cfg)
     return coll([_cell(i) for i in range(n)])
@@ -47,14 +52,19 @@ def test_probe_report_scalars_and_spectrum(tmp_path):
     device = torch.device("cpu")
 
     scalars, spectrum_path = probe_report(
-        enc, eval_batch, device, str(tmp_path), step=0,
-        probe_epochs=30, chunk=8, amp=False,
+        enc,
+        eval_batch,
+        device,
+        str(tmp_path),
+        step=0,
+        probe_epochs=30,
+        chunk=8,
+        amp=False,
     )
 
     expected = [
         "probe/clf/organ/balanced_accuracy",
         "probe/clf/organ/above_chance",
-        "probe/reg/gene_count/r2",
         "repr/effective_rank",
         "repr/effrank_ratio",
     ]

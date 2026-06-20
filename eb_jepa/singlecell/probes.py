@@ -182,9 +182,9 @@ def run_probe_suite(
     for key in clf_keys:
         if key in meta and len({x for x in meta[key] if x is not None}) >= 2:
             results[f"clf/{key}"] = train_classification_probe(features, meta[key])
-    # gene-count + any pathway/<name> regression targets (e.g. HALLMARK scores)
+    # pathway/<name> regression targets (e.g. HALLMARK scores) when provided
     for key, target in meta.items():
-        if key == "gene_count" or key.startswith("pathway/"):
+        if key.startswith("pathway/"):
             results[f"reg/{key}"] = train_regression_probe(
                 features, torch.as_tensor(target, dtype=torch.float32)
             )
