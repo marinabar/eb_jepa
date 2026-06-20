@@ -95,6 +95,7 @@ def build_train_module(cfg) -> TrainModule:
         use_cls=cfg.model.use_cls,
         readout=cfg.model.readout,
         grad_checkpoint=cfg.model.get("grad_checkpoint", False),
+        n_pathways=cfg.model.get("n_pathways", 0),
     )
     projector = Projector(
         f"{cfg.model.d_model}-{cfg.model.proj_hidden}-{cfg.model.proj_dim}",

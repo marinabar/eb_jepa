@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from eb_jepa.singlecell.embeddings import GeneTokenEmbedding
+from eb_jepa.singlecell.embeddings import GeneTokenEmbedding, PathwayEmbedding
 from eb_jepa.singlecell.layers import RMSNorm, TransformerBlock
 
 
@@ -46,6 +46,7 @@ class SingleCellEncoder(nn.Module):
         readout: str = "meanpool",
         drop_path: float | None = None,
         grad_checkpoint: bool = False,
+        n_pathways: int = 0,
     ):
         super().__init__()
         assert readout in ("meanpool", "cls")
@@ -56,6 +57,10 @@ class SingleCellEncoder(nn.Module):
         self.use_cls = use_cls
         self.readout = readout
         self.grad_checkpoint = grad_checkpoint
+        self.n_pathways = n_pathways
+        self.pathway_embed = (
+            PathwayEmbedding(n_pathways, d_model) if n_pathways > 0 else None
+        )
 
         if drop_path is None:
             drop_path = 0.1 if n_layers >= 16 else 0.0
@@ -85,20 +90,34 @@ class SingleCellEncoder(nn.Module):
         count_value: torch.Tensor | None = None,
         count_bin: torch.Tensor | None = None,
         count_mask: torch.Tensor | None = None,
+        pathway_count: torch.Tensor | None = None,
+        pathway_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         gene_token_ids / pad_mask / count_*: [B, L]. Returns [B, d_model] (pre-proj).
-        ``pad_mask`` is True at real tokens.
+        ``pad_mask`` is True at real tokens. When pathways are enabled, ``pathway_count``
+        / ``pathway_mask`` are [B, P]: P pathway tokens are appended after the gene
+        tokens (constant shape), attend alongside them, but are **excluded from the
+        readout** (the representation of interest stays gene-level). ``pathway_mask``
+        True = pathway token present this view (per-pathway dropout zeroes it).
         """
         x = self.embed(gene_token_ids, count_value, count_bin, count_mask)  # [B, L, d]
-        gene_mask = pad_mask
-        if self.use_cls:
+        gene_len = x.shape[1]  # L: the gene-token positions to pool over later
+        parts, mask_parts = [x], [pad_mask]
+        if self.use_cls:  # CLS prefix (only token with a dedicated identity)
             cls = self.cls_token.expand(x.shape[0], 1, -1)
-            x = torch.cat([cls, x], dim=1)
             cls_col = torch.ones(x.shape[0], 1, dtype=torch.bool, device=x.device)
-            attn_mask = torch.cat([cls_col, pad_mask], dim=1)
-        else:
-            attn_mask = pad_mask
+            parts.insert(0, cls)
+            mask_parts.insert(0, cls_col)
+        if self.pathway_embed is not None and pathway_count is not None:
+            parts.append(self.pathway_embed(pathway_count))  # [B, P, d]
+            if pathway_mask is None:
+                pathway_mask = torch.ones(
+                    pathway_count.shape, dtype=torch.bool, device=x.device
+                )
+            mask_parts.append(pathway_mask)
+        x = torch.cat(parts, dim=1)
+        attn_mask = torch.cat(mask_parts, dim=1)
 
         for block in self.blocks:
             if self.grad_checkpoint and self.training:
@@ -109,11 +128,12 @@ class SingleCellEncoder(nn.Module):
 
         if self.readout == "cls":
             return x[:, 0]
-        # masked mean over the gene tokens (exclude CLS, exclude padding)
-        if self.use_cls:
-            x = x[:, 1:]
-        m = gene_mask.unsqueeze(-1).to(x.dtype)
-        return (x * m).sum(1) / m.sum(1).clamp(min=1.0)
+        # masked mean over the GENE tokens only (exclude CLS prefix, pathway suffix,
+        # and padding). Gene positions are the contiguous [start : start+L] slice.
+        start = 1 if self.use_cls else 0
+        g = x[:, start : start + gene_len]
+        m = pad_mask.unsqueeze(-1).to(x.dtype)
+        return (g * m).sum(1) / m.sum(1).clamp(min=1.0)
 
 
 def encode_views(encoder: SingleCellEncoder, batch: dict) -> torch.Tensor:
@@ -129,11 +149,15 @@ def encode_views(encoder: SingleCellEncoder, batch: dict) -> torch.Tensor:
     cv = batch.get("count_value")
     cb = batch.get("count_bin")
     cm = batch.get("count_mask")
+    pc = batch.get("pathway_count")  # [V, N, P] or None
+    pm = batch.get("pathway_mask")  # [V, N, P] or None
     reps = encoder(
         flat_ids,
         flat_pad,
         count_value=cv.reshape(v * n, l) if cv is not None else None,
         count_bin=cb.reshape(v * n, l) if cb is not None else None,
         count_mask=cm.reshape(v * n, l) if cm is not None else None,
+        pathway_count=pc.reshape(v * n, -1) if pc is not None else None,
+        pathway_mask=pm.reshape(v * n, -1) if pm is not None else None,
     )
     return reps.reshape(v, n, -1)

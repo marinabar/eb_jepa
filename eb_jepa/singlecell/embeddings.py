@@ -56,6 +56,39 @@ class CountEmbedding(nn.Module):
         return self.table(count_bin)  # masked positions already carry bin == n_bins
 
 
+class PathwayEmbedding(nn.Module):
+    """Pathway tokens (CLAUDE.md "Pathways"): one token per hallmark pathway.
+
+    A pathway token is the **sum** of two components projected to d_model, mirroring a
+    gene token (identity + count):
+      1. a learned **pathway-identity** embedding (one row per pathway — apoptosis,
+         growth, ...), the analogue of the frozen ESMC+Evo2 gene identity;
+      2. a **count embedding** of the pathway's activity (the weighted sum of its
+         member genes' CP10k+log1p counts), encoded with the *same* continuous count
+         head as gene counts (mode A) so gene and pathway counts share an encoding —
+         mode A is used regardless of the gene count mode because pathway counts have
+         no per-gene quantile bins.
+
+    Pathway tokens attend alongside gene tokens but are excluded from the mean-pool
+    readout (the representation of interest stays gene-level); per-pathway dropout is
+    applied upstream (collator) via the attention mask, like gene drop views.
+    """
+
+    def __init__(self, n_pathways: int, d_model: int):
+        super().__init__()
+        self.n_pathways = n_pathways
+        self.identity = nn.Embedding(n_pathways, d_model)
+        nn.init.trunc_normal_(self.identity.weight, std=0.02)
+        self.count_emb = CountEmbedding(d_model, count_mode="A")
+
+    def forward(self, pathway_count: torch.Tensor) -> torch.Tensor:
+        """pathway_count: [..., P] -> pathway token embeddings [..., P, d_model]."""
+        ids = torch.arange(self.n_pathways, device=pathway_count.device)
+        ident = self.identity(ids)  # [P, d_model], broadcast over leading dims
+        cnt = self.count_emb(count_value=pathway_count)  # [..., P, d_model]
+        return ident + cnt
+
+
 class GeneTokenEmbedding(nn.Module):
     """Compose frozen ESMC+Evo2 lookups (projected) with the count embedding.
 
